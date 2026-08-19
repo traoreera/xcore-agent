@@ -1,0 +1,56 @@
+[project]
+name = "xcore-agent"
+version = "0.1.0"
+description = "Deployment agent for XCore .xdeploy artifacts — authenticates, downloads, verifies, decrypts, and installs plugin bundles on a target host."
+authors = [
+    { name = "InfinityWAB" },
+]
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.12,<4.0"
+
+dependencies = [
+    "pydantic>=2.11.7,<3.0.0",
+    "pyyaml>=6.0.3,<7.0.0",
+    "httpx>=0.28.1,<1.0.0",
+    "cryptography>=44.0.0,<45.0.0",
+    "typer>=0.15.0,<1.0.0",
+    "rich>=14.0.0,<15.0.0",
+    "zstandard>=0.23.0,<1.0.0",
+]
+
+[project.scripts]
+xcore-agent = "xcore_agent.cli:app"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+packages = [{ include = "xcore_agent" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest         = "^9.0.3"
+pytest-asyncio = "^1.2.0"
+black          = "^26.3.1"
+isort          = "^8.0.1"
+flake8         = "^7.3.0"
+mypy           = "^1.14.0"
+types-PyYAML   = "^6.0.0"
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
