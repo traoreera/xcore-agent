@@ -1,0 +1,181 @@
+"""Schema for `manifest.json` — the plaintext description of a `.xdeploy` artifact's
+contents, hashed and referenced by the outer signature so the agent can verify
+what it received matches what was built, independently of the encryption layer.
+"""
+
+import re
+from datetime import datetime
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_PROJECT_ID_RE = re.compile(r"^prj_[A-Za-z0-9]{10,40}$")
+_PLUGIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
+
+
+def _validate_sha256(v: str) -> str:
+    if not _SHA256_RE.match(v):
+        raise ValueError(f"invalid sha256 digest {v!r}")
+    return v
+
+
+class EnvironmentSpec(BaseModel):
+    """A plugin's declared `.env` contract — which variables the host
+    operator must fill in before the plugin can start. `write_env`
+    (agent/install_driver.py) checks `required` against the actual env
+    file after seeding it from the template."""
+
+    model_config = {"extra": "forbid"}
+
+    required: list[str] = Field(default_factory=list)
+    optional: list[str] = Field(default_factory=list)
+
+
+class PluginSource(BaseModel):
+    """Where to fetch a plugin's code from a git repository instead of (or
+    in addition to) what's embedded in the `.xdeploy` artifact — typically
+    handed out by a marketplace/registry as a resolvable link.
+
+    `ref` should be a commit SHA whenever integrity matters: it's the only
+    form that's content-addressed, so pinning to one lets `PluginRef.sha256`
+    (computed over the resolved tree) actually mean something. A branch or
+    tag is mutable — the code behind it can change without `sha256` in the
+    manifest ever being updated, silently defeating the tamper check.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    url: str
+    ref: str
+    subdirectory: str | None = None
+
+
+class PluginRef(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    id: str
+    version: str
+    # Required for an embedded plugin (hash of its files inside the
+    # artifact). Optional for a `source`-based plugin: the packer doesn't
+    # fetch external repositories at build time, so it has nothing to hash
+    # unless the caller pins one out of band. When present, the agent still
+    # verifies it against the resolved tree after fetching — see
+    # agent/pipeline.py's plugin resolution stage.
+    sha256: str | None = None
+    environment: EnvironmentSpec | None = None
+    source: PluginSource | None = None
+
+    @field_validator("id")
+    @classmethod
+    def _valid_id(cls, v: str) -> str:
+        if not _PLUGIN_ID_RE.match(v):
+            raise ValueError(f"invalid plugin id {v!r}")
+        return v
+
+    @field_validator("version")
+    @classmethod
+    def _valid_version(cls, v: str) -> str:
+        if not _SEMVER_RE.match(v):
+            raise ValueError(f"invalid semantic version {v!r}")
+        return v
+
+    @field_validator("sha256")
+    @classmethod
+    def _valid_sha256(cls, v: str | None) -> str | None:
+        return v if v is None else _validate_sha256(v)
+
+    @model_validator(mode="after")
+    def _require_hash_for_embedded_plugins(self) -> "PluginRef":
+        if self.source is None and self.sha256 is None:
+            raise ValueError(
+                f"plugin {self.id!r} has no 'source' — it's embedded in the artifact, "
+                "so 'sha256' is required"
+            )
+        return self
+
+
+class ExtensionRef(BaseModel):
+    """A shared, non-plugin service bundled into the artifact (e.g.
+    `extensions/xmailler`) — embedded by default, OR resolved from git at
+    deploy time via `source` (see `extensions/<id>/extension.yaml` —
+    `PluginSource` reused verbatim; the field name stays `source` for
+    symmetry with `PluginRef.source`, there's nothing plugin-specific about
+    it). Same rule as `PluginRef`: `sha256` is required unless `source` is
+    set — nothing to hash for a repo the packer never fetches at build time."""
+
+    model_config = {"extra": "forbid"}
+
+    id: str
+    sha256: str | None = None
+    source: PluginSource | None = None
+
+    @field_validator("id")
+    @classmethod
+    def _valid_id(cls, v: str) -> str:
+        if not _PLUGIN_ID_RE.match(v):
+            raise ValueError(f"invalid extension id {v!r}")
+        return v
+
+    @field_validator("sha256")
+    @classmethod
+    def _valid_sha256(cls, v: str | None) -> str | None:
+        return v if v is None else _validate_sha256(v)
+
+    @model_validator(mode="after")
+    def _require_hash_for_embedded_extensions(self) -> "ExtensionRef":
+        if self.source is None and self.sha256 is None:
+            raise ValueError(
+                f"extension {self.id!r} has no 'source' — it's embedded in the artifact, "
+                "so 'sha256' is required"
+            )
+        return self
+
+
+class ProjectManifest(BaseModel):
+    """Describes one built version of a project's `.xdeploy` artifact."""
+
+    model_config = {"extra": "forbid"}
+
+    format_version: str = Field(..., pattern=r"^\d+$")
+    project_id: str
+    project_name: str
+    version: str
+    built_at: datetime
+    plugins: list[PluginRef] = Field(..., min_length=1)
+    # Optional and separate from `plugins`: a project with no extensions/
+    # directory at all is the common case, not an error (unlike plugins,
+    # where an empty list is rejected in write_manifest — see builder.py).
+    extensions: list[ExtensionRef] = Field(default_factory=list)
+    content_sha256: str
+
+    @field_validator("project_id")
+    @classmethod
+    def _valid_project_id(cls, v: str) -> str:
+        if not _PROJECT_ID_RE.match(v):
+            raise ValueError(f"invalid project id {v!r}")
+        return v
+
+    @field_validator("version")
+    @classmethod
+    def _valid_version(cls, v: str) -> str:
+        if not _SEMVER_RE.match(v):
+            raise ValueError(f"invalid semantic version {v!r}")
+        return v
+
+    @field_validator("content_sha256")
+    @classmethod
+    def _valid_content_sha256(cls, v: str) -> str:
+        return _validate_sha256(v)
+
+    def plugin(self, plugin_id: str) -> PluginRef:
+        for p in self.plugins:
+            if p.id == plugin_id:
+                return p
+        raise KeyError(plugin_id)
+
+    def extension(self, extension_id: str) -> ExtensionRef:
+        for e in self.extensions:
+            if e.id == extension_id:
+                return e
+        raise KeyError(extension_id)

@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      - name: Cache Poetry virtualenv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
+
+      - name: Configure Poetry to use an in-project venv
+        run: poetry config virtualenvs.in-project true
+
+      - name: Install dependencies
+        run: poetry install --with dev --no-interaction
+
+      - name: black --check
+        run: poetry run black --check xcore_agent tests
+
+      - name: isort --check-only
+        run: poetry run isort --profile black --check-only xcore_agent tests
+
+      - name: flake8
+        run: poetry run flake8 xcore_agent tests
+
+      - name: mypy
+        run: poetry run mypy xcore_agent
+
+      - name: pytest
+        run: poetry run pytest -v
