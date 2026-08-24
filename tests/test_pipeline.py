@@ -22,7 +22,7 @@ from xcore_agent.agent.errors import ArtifactError, DeploymentError
 from xcore_agent.agent.hub_client import InMemoryHubClient
 from xcore_agent.agent.pipeline import DeploymentCredentials, DeploymentRunner
 from xcore_agent.agent.state import DeploymentState
-from xcore_agent.packer.builder import seal_directory, write_manifest
+from xcore_agent.packer.builder import _read_plugins_dirname, seal_directory, write_manifest
 from xcore_agent.plugin_resolver import PluginResolver
 
 PROJECT_ID = "prj_test0000001"
@@ -62,8 +62,17 @@ def _build_source_tree(root: Path, *, extra_steps: list[dict] | None = None) -> 
 
 
 def _seal(root: Path) -> dict:
-    """Write manifest.json and seal `root` with the real packer."""
-    write_manifest(root, project_id=PROJECT_ID, project_name="demo-project", version="1.0.0")
+    """Write manifest.json and seal `root` with the real packer. Resolves
+    `plugins_dirname` from integration.yaml the same way `build_artifact`
+    does, so a source tree using a non-default plugins directory (see
+    test_full_pipeline_with_custom_plugins_directory) seals correctly."""
+    write_manifest(
+        root,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        plugins_dirname=_read_plugins_dirname(root),
+    )
     ciphertext, dek, signature, public_key = seal_directory(root)
     return {"encrypted": ciphertext, "dek": dek, "signature": signature, "public_key": public_key}
 
@@ -114,6 +123,41 @@ async def test_full_pipeline_succeeds(tmp_path, sealed_artifact):
     env_file = runner.project_root / "plugins" / "demo.env"
     assert env_file.is_file()
     assert oct(env_file.stat().st_mode)[-3:] == "600"
+
+
+async def test_full_pipeline_with_custom_plugins_directory(tmp_path):
+    """A project whose integration.yaml declares `plugins: {directory: ./app}`
+    (Marketplace's own convention) builds and deploys correctly end to end —
+    plugins are read from `app/` at build time and installed back under
+    `app/` on the target host, not the "plugins" default."""
+    src = tmp_path / "src"
+    (src / "app" / "demo").mkdir(parents=True)
+    (src / "deployment").mkdir(parents=True)
+    src.joinpath("integration.yaml").write_text("plugins:\n  directory: ./app\n")
+    (src / "app" / "demo" / "plugin.yaml").write_text("name: demo\nversion: 1.0.0\n")
+    (src / "app" / "demo" / "main.py").write_text("# demo plugin\n")
+    install_plan = {
+        "format_version": "1",
+        "project_id": PROJECT_ID,
+        "version": "1.0.0",
+        "steps": [
+            {"id": "prepare", "action": "prepare"},
+            {"id": "install_demo", "action": "install_plugin", "plugin": "demo", "snapshot": True},
+            {"id": "start", "action": "start", "depends_on": ["install_demo"]},
+        ],
+    }
+    (src / "deployment" / "install.yaml").write_text(yaml.safe_dump(install_plan))
+
+    sealed = _seal(src)
+    runner, hub = _make_runner(tmp_path, sealed)
+    report = await runner.run()
+
+    assert report.status == "success"
+    assert runner.manifest.plugins_dirname == "app"
+    plugin_dir = runner.project_root / "app" / "demo"
+    assert (plugin_dir / "plugin.yaml").is_file()
+    # Not installed under the "plugins" default.
+    assert not (runner.project_root / "plugins").exists()
 
 
 async def test_full_pipeline_installs_extension(tmp_path):

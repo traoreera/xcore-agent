@@ -114,6 +114,35 @@ class DeploymentRunner:
         except DeploymentError:
             if self.state not in TERMINAL_STATES:
                 self._transition(DeploymentState.FAILED)
+            # Best-effort: a failed/rolled-back deployment never reported
+            # anything to the Hub before this — the fleet view (GET
+            # /deployments/{kind}/{slug}/hosts on the Marketplace) only ever
+            # saw successes, so a host stuck failing looked identical to one
+            # that was never deployed to at all. Skipped entirely if we never
+            # got far enough to have a session (can't notify without one) —
+            # deliberately NOT routed through self._notify()/self._transition,
+            # since FAILED/ROLLED_BACK are terminal states with no outgoing
+            # transition (see state.TRANSITIONS) and must stay that way.
+            if self.session is not None:
+                try:
+                    await self.hub.notify(
+                        self.session,
+                        DeploymentReport(
+                            project_id=self.credentials.project_id,
+                            deployment_id="",
+                            status="failed",
+                            version=self.version,
+                            started_at="",
+                            completed_at="",
+                            plugins=(
+                                [p.model_dump() for p in self.manifest.plugins]
+                                if self.manifest is not None
+                                else []
+                            ),
+                        ),
+                    )
+                except Exception:
+                    pass
             raise
 
     async def _authenticate(self) -> None:
@@ -186,6 +215,11 @@ class DeploymentRunner:
         self.manifest = ProjectManifest.model_validate_json(manifest_path.read_text())
         assert self.driver is not None
         self.driver.manifest = self.manifest
+        # The artifact may embed plugins under a directory other than
+        # "plugins" (see ProjectManifest.plugins_dirname) — propagate it to
+        # the Layout now so install_plugin() looks in the right place both
+        # inside the extracted artifact and on the target host.
+        self.driver.layout.plugins_dirname = self.manifest.plugins_dirname
 
         actual = crypto.compute_tree_digest(extracted_root, exclude=frozenset({_MANIFEST_FILENAME}))
         if actual != self.manifest.content_sha256:
@@ -269,7 +303,7 @@ class DeploymentRunner:
             # PluginSource's docstring, and note plugin.sha256 is OPTIONAL
             # for a source-based plugin, so an operator who never pins it
             # gets no protection against exactly that.
-            target = extracted_root / "plugins" / plugin.id
+            target = extracted_root / self.manifest.plugins_dirname / plugin.id
             target.mkdir(parents=True, exist_ok=True)
             shutil.copytree(resolved, target, dirs_exist_ok=True)
 

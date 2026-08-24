@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from rich.console import Console
 
 from .agent.docker_supervisor import DockerSupervisor
+from .agent.errors import DeploymentError
 from .agent.gc import GarbageCollector
 from .agent.hub_client import DeploymentReport, HttpHubClient
 from .agent.install_driver import Layout, Supervisor
@@ -245,6 +246,95 @@ def build(
 
 
 @app.command()
+def publish(
+    source_root: Path = typer.Argument(
+        ..., help="Project source tree: plugins/, integration.yaml, deployment/install.yaml"
+    ),
+    project_id: str = typer.Option(..., envvar="XCORE_PROJECT_ID"),
+    project_name: str = typer.Option(...),
+    version: str = typer.Option(..., help="Version to stamp on this artifact, e.g. 1.0.0"),
+    xdevkey: str = typer.Option(..., envvar="XCORE_XDEVKEY"),
+    hub_url: str = typer.Option("https://hub.xcorehub.dev", envvar="XCORE_HUB_URL"),
+    output: Path = typer.Option(
+        None,
+        help="Also write the sealed .xdeploy artifact here (optional — it stays "
+        "on Hub either way, this is just a local copy for your own records)",
+    ),
+    signing_key_file: Path = typer.Option(
+        None,
+        help="Path to a raw 32-byte Ed25519 private key. A throwaway key is "
+        "generated (and NOT saved) if omitted — fine for a one-off publish, "
+        "but a `watch`er needs the SAME trusted key across every version of "
+        "a project it's told to follow, so reuse one across builds if you "
+        "intend to keep publishing updates to this project_id.",
+    ),
+) -> None:
+    """Build, encrypt, sign, and upload a .xdeploy artifact to XCore Hub in
+    one step. `build` alone only produces a local file and prints the DEK to
+    your terminal with instructions to "hand this to the Hub" — nothing in
+    xcore-agent actually did that upload before this command existed. The
+    DEK never touches disk here: it stays in memory between build and
+    publish, exactly like `deploy`/`watch` never persist one either."""
+    import tempfile
+
+    signing_key = (
+        Ed25519PrivateKey.from_private_bytes(signing_key_file.read_bytes())
+        if signing_key_file is not None
+        else None
+    )
+
+    with tempfile.TemporaryDirectory(prefix="xcore-agent-publish-") as tmp:
+        artifact_path = output if output is not None else Path(tmp) / "artifact.xdeploy"
+        result = build_artifact(
+            source_root,
+            project_id=project_id,
+            project_name=project_name,
+            version=version,
+            output_path=artifact_path,
+            signing_key=signing_key,
+        )
+        console.print(f"[green]Built[/green] {artifact_path}")
+        console.print(f"  content_sha256: {result.manifest.content_sha256}")
+
+        async def _publish():
+            async with HttpHubClient(hub_url) as hub:
+                return await hub.publish(
+                    xdevkey=xdevkey,
+                    project_id=project_id,
+                    project_name=project_name,
+                    version=version,
+                    ciphertext=artifact_path.read_bytes(),
+                    content_sha256=result.manifest.content_sha256,
+                    dek=result.dek,
+                    signature=result.signature,
+                    signer_public_key=result.signer_public_key,
+                )
+
+        try:
+            published = asyncio.run(_publish())
+        except DeploymentError as exc:
+            console.print(f"[red]Publish failed:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]Published[/green] {project_id} v{published.version} to {hub_url}")
+    console.print(f"  artifact_id: {published.artifact_id}")
+    console.print(f"  size_bytes:  {published.size_bytes}")
+    if output is None:
+        console.print(
+            "[dim]No --output given: the local .xdeploy file was discarded — "
+            "it lives on the Hub now, re-download it if you need a local copy.[/dim]"
+        )
+    if signing_key_file is None:
+        console.print(
+            "[yellow]No --signing-key-file given: this used a throwaway key. "
+            "A `watch`er following this project must be told THIS run's "
+            "signer public key, and won't trust a future publish signed by a "
+            "different one.[/yellow]"
+        )
+        console.print(f"  signer public key (hex): {result.signer_public_key.hex()}")
+
+
+@app.command()
 def deploy(
     project_id: str = typer.Option(..., envvar="XCORE_PROJECT_ID"),
     version: str = typer.Option(..., help="Version to deploy, e.g. 1.0.0"),
@@ -347,12 +437,12 @@ def deploy_marketplace(
         "your trust decision, not the signature check alone.",
     ),
     hub_url: str = typer.Option(
-        "https://marketplace.xcore.dev",
+        "https://marketplace.xcorehub.dev",
         envvar="XCORE_HUB_URL",
         help="Hub root, WITHOUT a plugin segment — MarketplaceClient appends the "
         "right /app/<plugin> mount itself (marketplace, xservices, or "
         "xdeployments depending on the request; see marketplace_client.py's "
-        "module docstring). e.g. https://marketplace.xcore.dev, or "
+        "module docstring). e.g. https://marketplace.xcorehub.dev, or "
         "http://localhost:8000 for a local Hub.",
     ),
     project_root: Path = typer.Option(
@@ -442,12 +532,12 @@ def watch_marketplace(
         "--signing-secret for the trust-model caveat.",
     ),
     hub_url: str = typer.Option(
-        "https://marketplace.xcore.dev",
+        "https://marketplace.xcorehub.dev",
         envvar="XCORE_HUB_URL",
         help="Hub root, WITHOUT a plugin segment — MarketplaceClient appends the "
         "right /app/<plugin> mount itself (marketplace, xservices, or "
         "xdeployments depending on the request; see marketplace_client.py's "
-        "module docstring). e.g. https://marketplace.xcore.dev, or "
+        "module docstring). e.g. https://marketplace.xcorehub.dev, or "
         "http://localhost:8000 for a local Hub.",
     ),
     project_root: Path = typer.Option(

@@ -120,6 +120,8 @@ def sign_installed_plugin(plugin_dir: Path, secret_key: bytes) -> Path | None:
 
     sig_path = plugin_dir / SIG_FILENAME
     sig_path.write_text(
-        json.dumps({"plugin": name, "version": version, "digest": digest, "algo": "HMAC-SHA256"}, indent=2)
+        json.dumps(
+            {"plugin": name, "version": version, "digest": digest, "algo": "HMAC-SHA256"}, indent=2
+        )
     )
     return sig_path
