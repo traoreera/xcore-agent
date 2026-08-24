@@ -224,6 +224,75 @@ def test_plugin_missing_plugin_yaml_is_rejected(tmp_path):
         )
 
 
+def test_plugin_declaring_env_inject_without_template_is_rejected(tmp_path):
+    # Real incident this guards against: xauth's plugin.yaml declared
+    # envconfiguration.inject: true with no .env.template anywhere in the
+    # published repo — invisible at build time, only surfaced as a
+    # ManifestError when a real host tried to start the plugin.
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / "demo" / "plugin.yaml").write_text(
+        "name: demo\nversion: 1.0.0\n"
+        "envconfiguration:\n  inject: true\n  env_file: .env\n"
+    )
+
+    with pytest.raises(BuildError, match=r"\.env\.template"):
+        build_artifact(
+            src,
+            project_id=PROJECT_ID,
+            project_name="x",
+            version="1.0.0",
+            output_path=tmp_path / "out.xdeploy.enc",
+        )
+
+
+def test_plugin_declaring_env_inject_with_template_present_succeeds(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / "demo" / "plugin.yaml").write_text(
+        "name: demo\nversion: 1.0.0\n"
+        "envconfiguration:\n  inject: true\n  env_file: .env\n"
+    )
+    (src / "plugins" / "demo" / ".env.template").write_text("SOME_SECRET=${SOME_SECRET}\n")
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    assert result.manifest.plugins[0].id == "demo"
+
+
+def test_env_template_check_skipped_for_source_based_plugin(tmp_path):
+    # Nothing to check on disk for a plugin resolved from git at deploy
+    # time — same reasoning as sha256 being optional for source-based
+    # plugins (see _read_plugin_source).
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / "demo" / "plugin.yaml").write_text(
+        "name: demo\nversion: 1.0.0\n"
+        "envconfiguration:\n  inject: true\n  env_file: .env\n"
+        "source:\n  url: https://github.com/acme/demo.git\n"
+        f"  ref: {'a' * 40}\n"
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    assert result.manifest.plugins[0].source is not None
+
+
 def test_build_artifact_without_extensions_dir_leaves_manifest_extensions_empty(tmp_path):
     src = tmp_path / "src"
     src.mkdir()

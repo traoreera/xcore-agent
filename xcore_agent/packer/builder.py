@@ -167,6 +167,8 @@ def write_manifest(
         if not plugin_yaml.is_file():
             raise BuildError(f"plugin {plugin_dir.name!r} is missing plugin.yaml")
         source = _read_plugin_source(plugin_yaml)
+        if source is None:
+            _check_env_template_present(plugin_yaml, plugin_dir)
         plugin_refs.append(
             PluginRef(
                 id=plugin_dir.name,
@@ -308,6 +310,37 @@ def _read_plugin_environment(plugin_yaml: Path) -> EnvironmentSpec | None:
         return EnvironmentSpec.model_validate(raw)
     except Exception as exc:
         raise BuildError(f"{plugin_yaml} has an invalid 'environment' block: {exc}") from exc
+
+
+def _check_env_template_present(plugin_yaml: Path, plugin_dir: Path) -> None:
+    """If plugin.yaml declares `envconfiguration: {inject: true, env_file:
+    <name>}`, the plugin's own docker-entrypoint (by convention across this
+    ecosystem — see e.g. xauth/xdeploy/xdevkeys's plugin.yaml/.env.template)
+    reconstructs `<name>` from a physically-present `<name>.template` at
+    container startup. A plugin that declares `inject: true` but ships no
+    template fails at deploy time with a ManifestError the operator can't
+    see until a real host tries to start it — catch it here instead, at
+    build time, where the operator is still looking at this exact repo.
+
+    Only checked for embedded plugins: a `source:`-based plugin is resolved
+    from git at deploy time (see `_read_plugin_source`), so there's nothing
+    on disk here to check — the same reasoning `_read_plugin_source`'s
+    caller already applies to sha256."""
+    data = yaml.safe_load(plugin_yaml.read_text()) or {}
+    envconfig = data.get("envconfiguration")
+    if not isinstance(envconfig, dict) or not envconfig.get("inject"):
+        return
+    env_file = envconfig.get("env_file") or ".env"
+    template_path = plugin_dir / f"{env_file}.template"
+    if not template_path.is_file():
+        raise BuildError(
+            f"{plugin_yaml} declares envconfiguration.inject: true (env_file: "
+            f"{env_file!r}) but {template_path.name} is missing from "
+            f"{plugin_dir} — without it, the plugin fails to start on any "
+            "host with a ManifestError. Add one (placeholders only, "
+            "${VAR} per secret — see any other plugin in this ecosystem "
+            "for the convention) or set envconfiguration.inject: false."
+        )
 
 
 def _read_plugin_source(plugin_yaml: Path) -> PluginSource | None:
