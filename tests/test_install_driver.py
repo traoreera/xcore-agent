@@ -190,6 +190,23 @@ def test_install_plugin_does_not_sign_without_secret_key_configured(tmp_path):
     assert not (layout.plugin_dir("demo") / SIG_FILENAME).exists()
 
 
+def test_install_plugin_uses_custom_plugins_dirname(tmp_path):
+    # Layout.plugins_dirname set as DeploymentRunner._verify_manifest does
+    # from a manifest with plugins_dirname="app" — the extracted source AND
+    # the installed target should both live under "app/", not "plugins/".
+    layout = Layout(
+        project_root=tmp_path / "project", extracted_root=tmp_path / "extracted", plugins_dirname="app"
+    )
+    (layout.extracted_root / "app" / "demo").mkdir(parents=True)
+    (layout.extracted_root / "app" / "demo" / "plugin.yaml").write_text("name: demo\nversion: 1.0.0\n")
+
+    driver = InstallDriver(layout)
+    driver.install_plugin(InstallPluginStep(id="install_demo", action="install_plugin", plugin="demo"))
+
+    assert (tmp_path / "project" / "app" / "demo" / "plugin.yaml").is_file()
+    assert not (tmp_path / "project" / "plugins").exists()
+
+
 def test_install_extension_missing_from_extracted_artifact_raises(tmp_path):
     driver = InstallDriver(_layout(tmp_path))
     step = InstallExtensionStep(id="install_mail", action="install_extension", extension="mail")

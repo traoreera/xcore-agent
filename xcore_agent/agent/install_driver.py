@@ -49,10 +49,19 @@ class Layout:
 
     project_root: Path
     extracted_root: Path
+    # Which directory plugins live under, both inside the extracted artifact
+    # and on the target host — "plugins" unless the source project's own
+    # integration.yaml overrides it (e.g. "app" — see
+    # packer.builder._read_plugins_dirname). Defaults to "plugins" so every
+    # caller that never sets it (tests, `gc`, a manifest-less marketplace
+    # deploy) is unaffected; DeploymentRunner sets it from
+    # `manifest.plugins_dirname` once the manifest is parsed and verified —
+    # see pipeline.py's `_verify_manifest`.
+    plugins_dirname: str = "plugins"
 
     @property
     def plugins_dir(self) -> Path:
-        return self.project_root / "plugins"
+        return self.project_root / self.plugins_dirname
 
     @property
     def snapshots_dir(self) -> Path:
@@ -180,7 +189,7 @@ class InstallDriver:
         provisioner(step)
 
     def install_plugin(self, step: InstallPluginStep) -> None:
-        source = self.layout.extracted_root / "plugins" / step.plugin
+        source = self.layout.extracted_root / self.layout.plugins_dirname / step.plugin
         if not source.is_dir():
             raise InstallError(f"plugin {step.plugin!r} not found in extracted artifact")
         target = self.layout.plugin_dir(step.plugin)

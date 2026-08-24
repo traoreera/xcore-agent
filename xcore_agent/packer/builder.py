@@ -47,6 +47,34 @@ class BuildResult:
     signer_public_key: bytes
 
 
+def _read_plugins_dirname(source_root: Path) -> str:
+    """Read `plugins.directory` from the project's own `integration.yaml`
+    (e.g. `plugins:\n  directory: ./app`), so a project that doesn't use
+    the `plugins/` convention — like this repo, which loads plugins from
+    `app/` — still builds correctly instead of failing with "no plugins/
+    directory". Falls back to "plugins" (the prior hardcoded behavior) if
+    integration.yaml is missing, unreadable, or doesn't set it — every
+    project built before this existed keeps working unchanged. The
+    resolved name is recorded on the manifest as `plugins_dirname` so the
+    deploy side (agent/pipeline.py, agent/install_driver.py) reads back the
+    same convention instead of re-guessing "plugins"."""
+    integration_yaml = source_root / "integration.yaml"
+    if not integration_yaml.is_file():
+        return "plugins"
+    try:
+        data = yaml.safe_load(integration_yaml.read_text()) or {}
+    except yaml.YAMLError:
+        return "plugins"
+    raw = data.get("plugins") if isinstance(data, dict) else None
+    directory = raw.get("directory") if isinstance(raw, dict) else None
+    if not isinstance(directory, str) or not directory.strip():
+        return "plugins"
+    # Conventionally written relative to source_root, e.g. "./app" — strip
+    # that down to a plain directory name/path so it composes the same way
+    # as the "plugins" default everywhere it's used below.
+    return directory.strip().removeprefix("./").strip("/") or "plugins"
+
+
 def build_artifact(
     source_root: Path,
     *,
@@ -58,7 +86,9 @@ def build_artifact(
 ) -> BuildResult:
     """Build, encrypt, and sign a `.xdeploy` artifact from `source_root`.
 
-    `source_root` must already contain `plugins/`, `integration.yaml`, and
+    `source_root` must already contain a plugins directory (`plugins/` by
+    default — see `_read_plugins_dirname` for how a project overrides that
+    via `integration.yaml`'s `plugins.directory`), `integration.yaml`, and
     `deployment/install.yaml`. This writes `manifest.json` into it (and
     refuses to run if one is already there — see `write_manifest`). Pass
     `signing_key` to sign with a specific, persisted Hub key; a fresh
@@ -75,9 +105,16 @@ def build_artifact(
     ever reads back out of it. `source_root` itself is never mutated —
     pruning happens on a temporary copy that gets sealed and discarded.
     """
-    _validate_source_tree(source_root, project_id=project_id, version=version)
+    plugins_dirname = _read_plugins_dirname(source_root)
+    _validate_source_tree(
+        source_root, project_id=project_id, version=version, plugins_dirname=plugins_dirname
+    )
     manifest = write_manifest(
-        source_root, project_id=project_id, project_name=project_name, version=version
+        source_root,
+        project_id=project_id,
+        project_name=project_name,
+        version=version,
+        plugins_dirname=plugins_dirname,
     )
     with tempfile.TemporaryDirectory(prefix="xcore-agent-pack-") as tmp:
         packaging_root = Path(tmp) / "package"
@@ -99,7 +136,7 @@ def build_artifact(
 
 
 def write_manifest(
-    source_root: Path, *, project_id: str, project_name: str, version: str
+    source_root: Path, *, project_id: str, project_name: str, version: str, plugins_dirname: str = "plugins"
 ) -> ProjectManifest:
     """Compute per-plugin and whole-tree content hashes and write
     `manifest.json` into `source_root`. Refuses to overwrite an existing one:
@@ -112,7 +149,7 @@ def write_manifest(
             "the packer always regenerates it from the current tree"
         )
 
-    plugins_dir = source_root / "plugins"
+    plugins_dir = source_root / plugins_dirname
     plugin_refs = []
     for plugin_dir in sorted(p for p in plugins_dir.iterdir() if p.is_dir()):
         plugin_yaml = plugin_dir / "plugin.yaml"
@@ -134,7 +171,7 @@ def write_manifest(
             )
         )
     if not plugin_refs:
-        raise BuildError("no plugins found under plugins/")
+        raise BuildError(f"no plugins found under {plugins_dirname}/")
 
     extension_refs = []
     extensions_dir = source_root / "extensions"
@@ -163,6 +200,7 @@ def write_manifest(
         built_at=datetime.now(timezone.utc),
         plugins=plugin_refs,
         extensions=extension_refs,
+        plugins_dirname=plugins_dirname,
         content_sha256=content_sha256,
     )
     manifest_path.write_text(manifest.model_dump_json())
@@ -195,13 +233,15 @@ def seal_directory(
     return ciphertext, dek, signature, signer_public_key
 
 
-def _validate_source_tree(source_root: Path, *, project_id: str, version: str) -> None:
+def _validate_source_tree(
+    source_root: Path, *, project_id: str, version: str, plugins_dirname: str = "plugins"
+) -> None:
     if not (source_root / "integration.yaml").is_file():
         raise BuildError("source tree is missing integration.yaml")
 
-    plugins_dir = source_root / "plugins"
+    plugins_dir = source_root / plugins_dirname
     if not plugins_dir.is_dir() or not any(plugins_dir.iterdir()):
-        raise BuildError("source tree has no plugins/ directory (or it's empty)")
+        raise BuildError(f"source tree has no {plugins_dirname}/ directory (or it's empty)")
 
     install_path = source_root / INSTALL_PLAN_PATH
     if not install_path.is_file():
@@ -223,7 +263,7 @@ def _validate_source_tree(source_root: Path, *, project_id: str, version: str) -
         if plugin_id and not (plugins_dir / plugin_id).is_dir():
             raise BuildError(
                 f"install.yaml step {step.id!r} references plugin {plugin_id!r} "
-                f"but plugins/{plugin_id}/ is missing"
+                f"but {plugins_dirname}/{plugin_id}/ is missing"
             )
         extension_id = getattr(step, "extension", None)
         if extension_id and not (extensions_dir / extension_id).is_dir():
@@ -296,7 +336,9 @@ def _prepare_packaging_view(
 
     for plugin in manifest.plugins:
         if plugin.source is not None:
-            _prune_to_manifest_only(packaging_root / "plugins" / plugin.id, "plugin.yaml")
+            _prune_to_manifest_only(
+                packaging_root / manifest.plugins_dirname / plugin.id, "plugin.yaml"
+            )
 
     for extension in manifest.extensions:
         if extension.source is not None:
