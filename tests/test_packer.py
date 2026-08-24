@@ -293,6 +293,133 @@ def test_env_template_check_skipped_for_source_based_plugin(tmp_path):
     assert result.manifest.plugins[0].source is not None
 
 
+def test_plugin_resolved_from_xcli_registry_when_no_explicit_source(tmp_path):
+    # .xcore-registry.json is written by `xcli plugin install --source
+    # marketplace|git` (xcoreCli) as a sibling of every plugin directory —
+    # a plugin with no source: of its own in plugin.yaml should still be
+    # resolved from git at deploy time if the registry says how it got here.
+    import json
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / ".xcore-registry.json").write_text(
+        json.dumps(
+            {
+                "demo": {
+                    "source": "marketplace",
+                    "slug": "demo",
+                    "kind": "plugin",
+                    "version": "1.0.0",
+                    "repository": "https://github.com/acme/demo",
+                    "ref": "b" * 40,
+                }
+            }
+        )
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    plugin = result.manifest.plugins[0]
+    assert plugin.source is not None
+    assert plugin.source.url == "https://github.com/acme/demo"
+    assert plugin.source.ref == "b" * 40
+    assert plugin.sha256 is None  # source-based, nothing embedded to hash
+
+
+def test_explicit_plugin_yaml_source_wins_over_registry(tmp_path):
+    import json
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / "demo" / "plugin.yaml").write_text(
+        "name: demo\nversion: 1.0.0\nsource:\n  url: https://github.com/explicit/demo.git\n"
+        f"  ref: {'c' * 40}\n"
+    )
+    (src / "plugins" / ".xcore-registry.json").write_text(
+        json.dumps(
+            {
+                "demo": {
+                    "source": "marketplace",
+                    "repository": "https://github.com/registry/demo",
+                    "ref": "d" * 40,
+                }
+            }
+        )
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    assert result.manifest.plugins[0].source.url == "https://github.com/explicit/demo.git"
+
+
+def test_registry_entry_missing_ref_falls_back_to_embedding(tmp_path):
+    import json
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / ".xcore-registry.json").write_text(
+        json.dumps({"demo": {"source": "marketplace", "repository": "https://github.com/acme/demo"}})
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    plugin = result.manifest.plugins[0]
+    assert plugin.source is None
+    assert plugin.sha256 is not None  # embedded, hashed normally
+
+
+def test_registry_entry_from_local_zip_install_is_ignored(tmp_path):
+    # source: "zip" (a one-off local zip install, no stable origin to
+    # re-resolve from) must not be trusted the way marketplace/git are.
+    import json
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / ".xcore-registry.json").write_text(
+        json.dumps(
+            {
+                "demo": {
+                    "source": "zip",
+                    "repository": "https://example.com/demo.zip",
+                    "ref": "e" * 40,
+                }
+            }
+        )
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    assert result.manifest.plugins[0].source is None
+
+
 def test_build_artifact_without_extensions_dir_leaves_manifest_extensions_empty(tmp_path):
     src = tmp_path / "src"
     src.mkdir()

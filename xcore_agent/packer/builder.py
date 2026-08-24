@@ -9,6 +9,7 @@ between "what the packer hashed" and "what the agent re-hashes".
 """
 
 import io
+import json
 import secrets
 import shutil
 import tarfile
@@ -166,7 +167,7 @@ def write_manifest(
         plugin_yaml = plugin_dir / "plugin.yaml"
         if not plugin_yaml.is_file():
             raise BuildError(f"plugin {plugin_dir.name!r} is missing plugin.yaml")
-        source = _read_plugin_source(plugin_yaml)
+        source = _read_plugin_source(plugin_yaml) or _read_registry_source(plugin_dir)
         if source is None:
             _check_env_template_present(plugin_yaml, plugin_dir)
         plugin_refs.append(
@@ -355,6 +356,41 @@ def _read_plugin_source(plugin_yaml: Path) -> PluginSource | None:
         return PluginSource.model_validate(raw)
     except Exception as exc:
         raise BuildError(f"{plugin_yaml} has an invalid 'source' block: {exc}") from exc
+
+
+def _read_registry_source(plugin_dir: Path) -> PluginSource | None:
+    """Fallback for a plugin with no explicit `source:` in its own
+    plugin.yaml: check `.xcore-registry.json`, a sibling of every plugin
+    directory (`plugins_dir / ".xcore-registry.json"`) written by `xcli
+    plugin install --source marketplace|git` — see xcoreCli's
+    install_commands.py. Lets a plugin installed that way get resolved
+    from its real origin at deploy time automatically, without an operator
+    hand-writing `source:` into plugin.yaml (what this whole mechanism used
+    to require — see the xauth/xmailler/etc. plugin.yaml edits that
+    motivated this).
+
+    Only trusts a 'marketplace' or 'git' entry with both `repository` and
+    `ref` populated — anything else (a local zip install, a partial/failed
+    registry write, an entry from before ref resolution existed) falls
+    through to the safe default: embed the plugin's actual files instead
+    of guessing at a source."""
+    registry_path = plugin_dir.parent / ".xcore-registry.json"
+    if not registry_path.is_file():
+        return None
+    try:
+        registry = json.loads(registry_path.read_text())
+    except (OSError, ValueError):
+        return None
+    entry = registry.get(plugin_dir.name)
+    if not isinstance(entry, dict) or entry.get("source") not in ("marketplace", "git"):
+        return None
+    repository, ref = entry.get("repository"), entry.get("ref")
+    if not repository or not ref:
+        return None
+    try:
+        return PluginSource(url=repository, ref=ref)
+    except Exception:
+        return None
 
 
 def _read_extension_source(extension_yaml: Path) -> PluginSource | None:
