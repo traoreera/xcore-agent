@@ -31,7 +31,7 @@ rather than a drop-in `HubClient` implementation:
     Plugin artifacts live under the `marketplace` plugin, service artifacts
     under `xservices`, and deployment reporting under a *third*, separate
     `xdeployments` plugin — `base_url` is therefore the Hub's bare root
-    (e.g. `https://marketplace.xcore.dev`, no plugin segment), and each
+    (e.g. `https://marketplace.xcorehub.dev`, no plugin segment), and each
     request below picks its own `/app/<plugin-name>` mount internally so
     callers never need to know this backend's internal plugin layout.
 """

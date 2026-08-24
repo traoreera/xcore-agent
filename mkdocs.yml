@@ -1,0 +1,126 @@
+site_name: xcore-agent
+site_description: Deployment agent for XCore .xdeploy artifacts — authenticates, downloads, verifies, decrypts, and installs plugin bundles on a target host.
+site_url: https://traoreera.github.io/xcore-agent/
+repo_url: https://github.com/traoreera/xcore-agent
+repo_name: traoreera/xcore-agent
+edit_uri: blob/main/docs/
+
+theme:
+  name: material
+  language: en
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+    logo: material/rocket-launch-outline
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          options:
+            show_source: true
+            show_root_heading: true
+            show_root_toc_entry: true
+            show_category_heading: false
+            show_if_no_docstring: true
+            show_signature: true
+            show_signature_annotations: true
+            members_order: source
+            docstring_section_style: list
+            inherited_members: true
+            heading_level: 3
+          import:
+            - https://raw.githubusercontent.com/pydantic/pydantic/main/pydantic/json_schema.py
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+  - pymdownx.snippets
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - tables
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/traoreera/xcore-agent
+
+extra_css:
+  - stylesheets/extra.css
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Usage:
+      - CLI reference: usage.md
+      - init-plan scaffolding: scaffold.md
+  - Architecture:
+      - Overview & layout: architecture.md
+      - Deployment pipelines: pipelines.md
+      - State machines & security: security.md
+  - Real marketplace flow: marketplace.md
+  - Concepts:
+      - Plugins: plugins.md
+      - Provisioning backing services: provisioning.md
+      - Key custody: key-custody.md
+  - API reference:
+      - Agent:
+          - Deployment pipeline: api/pipeline.md
+          - Marketplace pipeline: api/marketplace_pipeline.md
+          - Hub clients: api/hub_client.md
+          - Marketplace client: api/marketplace_client.md
+          - Watchers: api/watcher.md
+          - Install driver: api/install_driver.md
+          - Garbage collector: api/gc.md
+          - Supervisors: api/supervisors.md
+          - Provisioners: api/provisioners.md
+          - State & errors: api/state.md
+      - Packer: api/packer.md
+      - Schemas: api/schema.md
+      - Crypto: api/crypto.md
+      - Plugin resolution: api/plugin_resolver.md
+      - Scaffold: api/scaffold.md
+      - CLI: api/cli.md

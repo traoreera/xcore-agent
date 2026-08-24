@@ -34,6 +34,16 @@ token except /v1/auth itself; binary fields are base64):
     POST /v1/deployments/report
         -> DeploymentReport fields
         <- {deployment_id}
+
+    POST /v1/projects/{project_id}/publish                      (validated against
+        -> multipart/form-data:                                   a real XCore Hub —
+             version, project_name, content_sha256,                see app/xdeploy in
+             dek (base64), signature (base64),                     the Marketplace repo)
+             signer_public_key (base64), artifact (file)
+        -> header: X-API-Key: <xdevkey>       (not session-bearer — publish is a
+                                                 local build-time act, not a
+                                                 deployment; no prior /v1/auth needed)
+        <- {artifact_id, project_id, version, content_sha256, size_bytes, created_at}
 """
 
 import base64
@@ -43,7 +53,7 @@ from typing import Protocol
 
 import httpx
 
-from .errors import ArtifactError, AuthenticationError, DeploymentError
+from .errors import ArtifactError, AuthenticationError, DeploymentError, PublishError
 
 
 @dataclass(frozen=True)
@@ -63,6 +73,18 @@ class ArtifactLocation:
     download_url: str
     signature: bytes
     signer_public_key: bytes
+
+
+@dataclass(frozen=True)
+class PublishResult:
+    """What XCore Hub confirms after accepting a newly published artifact."""
+
+    artifact_id: str
+    project_id: str
+    version: str
+    content_sha256: str
+    size_bytes: int
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -103,6 +125,25 @@ class HubClient(Protocol):
         ...
 
     async def notify(self, session: Session, report: DeploymentReport) -> None: ...
+
+    async def publish(
+        self,
+        *,
+        xdevkey: str,
+        project_id: str,
+        project_name: str,
+        version: str,
+        ciphertext: bytes,
+        content_sha256: str,
+        dek: bytes,
+        signature: bytes,
+        signer_public_key: bytes,
+    ) -> PublishResult:
+        """Upload a freshly built artifact (see `packer.builder.build_artifact`)
+        to XCore Hub for storage. Authenticated by raw `xdevkey`, not a
+        `Session` — publishing is a local build-time act performed before
+        any agent ever calls `authenticate`/`/v1/auth` for this artifact."""
+        ...
 
 
 @dataclass
@@ -159,6 +200,26 @@ class InMemoryHubClient:
 
     async def notify(self, session: Session, report: DeploymentReport) -> None:
         self.notified.append(report)
+
+    async def publish(
+        self,
+        *,
+        xdevkey: str,
+        project_id: str,
+        project_name: str,
+        version: str,
+        ciphertext: bytes,
+        content_sha256: str,
+        dek: bytes,
+        signature: bytes,
+        signer_public_key: bytes,
+    ) -> PublishResult:
+        raise NotImplementedError(
+            "InMemoryHubClient is pre-seeded with one fixed artifact for "
+            "exercising DeploymentRunner — it has no publish-time storage to "
+            "accept a new one into; nothing in the deployment pipeline calls "
+            "publish() anyway (it's a CLI build-time act, see cli.py::publish)"
+        )
 
 
 def _auth_header(session: Session) -> dict[str, str]:
@@ -283,3 +344,42 @@ class HttpHubClient:
             },
         )
         _raise_for_status(response, DeploymentError, "notify")
+
+    async def publish(
+        self,
+        *,
+        xdevkey: str,
+        project_id: str,
+        project_name: str,
+        version: str,
+        ciphertext: bytes,
+        content_sha256: str,
+        dek: bytes,
+        signature: bytes,
+        signer_public_key: bytes,
+    ) -> PublishResult:
+        response = await self._client.post(
+            f"/v1/projects/{project_id}/publish",
+            headers={"X-API-Key": xdevkey},
+            data={
+                "version": version,
+                "project_name": project_name,
+                "content_sha256": content_sha256,
+                "dek": base64.b64encode(dek).decode("ascii"),
+                "signature": base64.b64encode(signature).decode("ascii"),
+                "signer_public_key": base64.b64encode(signer_public_key).decode("ascii"),
+            },
+            files={"artifact": ("artifact.xdeploy", ciphertext, "application/octet-stream")},
+        )
+        if response.status_code in (401, 403):
+            raise AuthenticationError(f"publish denied: {_error_message(response)}")
+        _raise_for_status(response, PublishError, "publish")
+        data = response.json()
+        return PublishResult(
+            artifact_id=data["artifact_id"],
+            project_id=data["project_id"],
+            version=data["version"],
+            content_sha256=data["content_sha256"],
+            size_bytes=data["size_bytes"],
+            created_at=data["created_at"],
+        )

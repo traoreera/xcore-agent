@@ -403,6 +403,61 @@ def test_install_extension_step_referencing_missing_extension_dir_is_rejected(tm
         )
 
 
+def test_build_artifact_reads_custom_plugins_directory_from_integration_yaml(tmp_path):
+    """A project whose integration.yaml declares `plugins: {directory: ./app}`
+    (Marketplace's own convention — see backends/integration.yaml) builds
+    from `app/` instead of requiring a `plugins/` directory that doesn't
+    exist in that layout."""
+    src = tmp_path / "src"
+    (src / "app" / "demo").mkdir(parents=True)
+    (src / "deployment").mkdir(parents=True)
+    src.joinpath("integration.yaml").write_text("plugins:\n  directory: ./app\n")
+    (src / "app" / "demo" / "plugin.yaml").write_text("name: demo\nversion: 1.0.0\n")
+    (src / "app" / "demo" / "main.py").write_text("# demo plugin\n")
+    install_plan = {
+        "format_version": "1",
+        "project_id": PROJECT_ID,
+        "version": "1.0.0",
+        "steps": [
+            {"id": "prepare", "action": "prepare"},
+            {"id": "install_demo", "action": "install_plugin", "plugin": "demo"},
+        ],
+    }
+    (src / "deployment" / "install.yaml").write_text(yaml.safe_dump(install_plan))
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    assert result.manifest.plugins_dirname == "app"
+    assert result.manifest.plugins[0].id == "demo"
+    members = _extracted_member_names(result)
+    assert "./app/demo/plugin.yaml" in members
+    assert "./plugins" not in members
+
+
+def test_build_artifact_without_plugins_directory_setting_defaults_to_plugins(tmp_path):
+    """integration.yaml with no `plugins:` block at all (or one that omits
+    `directory`) keeps the prior hardcoded "plugins" behavior."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    assert result.manifest.plugins_dirname == "plugins"
+
+
 def test_preexisting_manifest_is_rejected(tmp_path):
     src = tmp_path / "src"
     src.mkdir()

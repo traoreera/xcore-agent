@@ -12,6 +12,12 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PROJECT_ID_RE = re.compile(r"^prj_[A-Za-z0-9]{10,40}$")
 _PLUGIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
+# A relative path, one or more `/`-separated segments, none of them `.`/`..`
+# — deliberately stricter than an arbitrary path: this is a single directory
+# name inside a trusted `.xdeploy` artifact, not user-supplied filesystem
+# input, so there's no reason to allow anything an attacker could use to
+# climb out of the extracted tree.
+_PLUGINS_DIRNAME_RE = re.compile(r"^[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$")
 
 
 def _validate_sha256(v: str) -> str:
@@ -147,7 +153,23 @@ class ProjectManifest(BaseModel):
     # directory at all is the common case, not an error (unlike plugins,
     # where an empty list is rejected in write_manifest — see builder.py).
     extensions: list[ExtensionRef] = Field(default_factory=list)
+    # Which top-level directory `plugins` were embedded under inside this
+    # artifact — read at build time from the source project's own
+    # `integration.yaml` (`plugins.directory`, e.g. `./app`), so a project
+    # that doesn't use the `plugins/` convention still round-trips through
+    # build -> deploy correctly. Defaults to "plugins" so an artifact built
+    # before this field existed (or a project that never overrides the
+    # default) still parses the same as always — see packer/builder.py and
+    # agent/pipeline.py/install_driver.py for where it's read back.
+    plugins_dirname: str = "plugins"
     content_sha256: str
+
+    @field_validator("plugins_dirname")
+    @classmethod
+    def _valid_plugins_dirname(cls, v: str) -> str:
+        if not _PLUGINS_DIRNAME_RE.match(v):
+            raise ValueError(f"invalid plugins_dirname {v!r}")
+        return v
 
     @field_validator("project_id")
     @classmethod

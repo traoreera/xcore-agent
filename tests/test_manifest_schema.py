@@ -60,6 +60,23 @@ def test_extra_fields_are_rejected():
         ProjectManifest.model_validate(bad)
 
 
+def test_plugins_dirname_defaults_to_plugins():
+    manifest = ProjectManifest.model_validate(VALID_MANIFEST)
+    assert manifest.plugins_dirname == "plugins"
+
+
+def test_plugins_dirname_accepts_a_custom_value():
+    manifest = ProjectManifest.model_validate({**VALID_MANIFEST, "plugins_dirname": "app"})
+    assert manifest.plugins_dirname == "app"
+
+
+@pytest.mark.parametrize("bad_value", ["", "/absolute", "../escape", "has space", "trailing/"])
+def test_invalid_plugins_dirname_is_rejected(bad_value):
+    bad = {**VALID_MANIFEST, "plugins_dirname": bad_value}
+    with pytest.raises(ValidationError):
+        ProjectManifest.model_validate(bad)
+
+
 def test_extensions_default_to_empty_list():
     # A project with no extensions/ directory at all is the common case,
     # not an error — unlike `plugins`, which is rejected if empty.

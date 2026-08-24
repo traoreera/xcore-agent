@@ -12,7 +12,12 @@ import pytest
 from xcore_agent.agent.errors import InstallError
 from xcore_agent.agent.install_driver import InstallDriver, Layout
 from xcore_agent.agent.plugin_signing import SIG_FILENAME
-from xcore_agent.schema.install import InstallExtensionStep, InstallPluginStep, ProvisionStep, WriteEnvStep
+from xcore_agent.schema.install import (
+    InstallExtensionStep,
+    InstallPluginStep,
+    ProvisionStep,
+    WriteEnvStep,
+)
 from xcore_agent.schema.manifest import EnvironmentSpec, PluginRef, ProjectManifest
 
 PROJECT_ID = "prj_test0000001"
@@ -167,7 +172,9 @@ def test_install_plugin_signs_trusted_plugin_when_secret_key_configured(tmp_path
     (layout.extracted_root / "plugins" / "demo" / "src" / "main.py").write_text("# demo\n")
 
     driver = InstallDriver(layout, plugin_secret_key=b"host-secret")
-    driver.install_plugin(InstallPluginStep(id="install_demo", action="install_plugin", plugin="demo"))
+    driver.install_plugin(
+        InstallPluginStep(id="install_demo", action="install_plugin", plugin="demo")
+    )
 
     sig_path = layout.plugin_dir("demo") / SIG_FILENAME
     assert sig_path.is_file()
@@ -185,9 +192,34 @@ def test_install_plugin_does_not_sign_without_secret_key_configured(tmp_path):
     (layout.extracted_root / "plugins" / "demo" / "src" / "main.py").write_text("# demo\n")
 
     driver = InstallDriver(layout)  # plugin_secret_key defaults to None
-    driver.install_plugin(InstallPluginStep(id="install_demo", action="install_plugin", plugin="demo"))
+    driver.install_plugin(
+        InstallPluginStep(id="install_demo", action="install_plugin", plugin="demo")
+    )
 
     assert not (layout.plugin_dir("demo") / SIG_FILENAME).exists()
+
+
+def test_install_plugin_uses_custom_plugins_dirname(tmp_path):
+    # Layout.plugins_dirname set as DeploymentRunner._verify_manifest does
+    # from a manifest with plugins_dirname="app" — the extracted source AND
+    # the installed target should both live under "app/", not "plugins/".
+    layout = Layout(
+        project_root=tmp_path / "project",
+        extracted_root=tmp_path / "extracted",
+        plugins_dirname="app",
+    )
+    (layout.extracted_root / "app" / "demo").mkdir(parents=True)
+    (layout.extracted_root / "app" / "demo" / "plugin.yaml").write_text(
+        "name: demo\nversion: 1.0.0\n"
+    )
+
+    driver = InstallDriver(layout)
+    driver.install_plugin(
+        InstallPluginStep(id="install_demo", action="install_plugin", plugin="demo")
+    )
+
+    assert (tmp_path / "project" / "app" / "demo" / "plugin.yaml").is_file()
+    assert not (tmp_path / "project" / "plugins").exists()
 
 
 def test_install_extension_missing_from_extracted_artifact_raises(tmp_path):
