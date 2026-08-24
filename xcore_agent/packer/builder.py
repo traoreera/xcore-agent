@@ -24,7 +24,13 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .. import crypto
 from ..schema.install import InstallPlan
-from ..schema.manifest import EnvironmentSpec, ExtensionRef, PluginRef, PluginSource, ProjectManifest
+from ..schema.manifest import (
+    EnvironmentSpec,
+    ExtensionRef,
+    PluginRef,
+    PluginSource,
+    ProjectManifest,
+)
 
 MANIFEST_FILENAME = "manifest.json"
 INSTALL_PLAN_PATH = "deployment/install.yaml"
@@ -136,7 +142,12 @@ def build_artifact(
 
 
 def write_manifest(
-    source_root: Path, *, project_id: str, project_name: str, version: str, plugins_dirname: str = "plugins"
+    source_root: Path,
+    *,
+    project_id: str,
+    project_name: str,
+    version: str,
+    plugins_dirname: str = "plugins",
 ) -> ProjectManifest:
     """Compute per-plugin and whole-tree content hashes and write
     `manifest.json` into `source_root`. Refuses to overwrite an existing one:
@@ -185,7 +196,11 @@ def write_manifest(
             extension_refs.append(
                 ExtensionRef(
                     id=extension_dir.name,
-                    sha256=None if ext_source is not None else crypto.compute_tree_digest(extension_dir),
+                    sha256=(
+                        None
+                        if ext_source is not None
+                        else crypto.compute_tree_digest(extension_dir)
+                    ),
                     source=ext_source,
                 )
             )

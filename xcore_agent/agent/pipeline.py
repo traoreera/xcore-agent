@@ -134,9 +134,11 @@ class DeploymentRunner:
                             version=self.version,
                             started_at="",
                             completed_at="",
-                            plugins=[p.model_dump() for p in self.manifest.plugins]
-                            if self.manifest is not None
-                            else [],
+                            plugins=(
+                                [p.model_dump() for p in self.manifest.plugins]
+                                if self.manifest is not None
+                                else []
+                            ),
                         ),
                     )
                 except Exception:

@@ -11,8 +11,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from rich.console import Console
 
 from .agent.docker_supervisor import DockerSupervisor
-from .agent.gc import GarbageCollector
 from .agent.errors import DeploymentError
+from .agent.gc import GarbageCollector
 from .agent.hub_client import DeploymentReport, HttpHubClient
 from .agent.install_driver import Layout, Supervisor
 from .agent.kubernetes_supervisor import KubernetesSupervisor

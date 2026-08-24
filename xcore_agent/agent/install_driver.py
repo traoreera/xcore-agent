@@ -147,7 +147,11 @@ class InstallDriver:
         self._snapshots: list[SnapshotRecord] = []
 
     def snapshot_before(self, step_id: str, plugin_id: str, *, kind: str = "plugin") -> None:
-        target = self.layout.plugin_dir(plugin_id) if kind == "plugin" else self.layout.extension_dir(plugin_id)
+        target = (
+            self.layout.plugin_dir(plugin_id)
+            if kind == "plugin"
+            else self.layout.extension_dir(plugin_id)
+        )
         if not target.exists():
             self._snapshots.append(
                 SnapshotRecord(step_id=step_id, plugin_id=plugin_id, saved_path=None, kind=kind)
