@@ -9,6 +9,7 @@ not something xcore-agent should hardcode. `NullSupervisor` is provided for
 tests and dry runs.
 """
 
+import logging
 import os
 import shutil
 import time
@@ -22,6 +23,7 @@ from ..schema.install import (
     HealthcheckStep,
     InstallExtensionStep,
     InstallPluginStep,
+    NotifyStep,
     ProvisionStep,
     RestartStep,
     StartStep,
@@ -32,11 +34,20 @@ from ..schema.manifest import ProjectManifest
 from .errors import HealthcheckError, InstallError
 from .plugin_signing import sign_installed_plugin
 
+logger = logging.getLogger(__name__)
+
 # A provisioner performs a `provision` step's work (e.g. creating a database,
 # a message queue, ...) for one plugin. Registered by the caller — see
 # InstallDriver's `provisioners` argument — because what "provisioning
 # xcore.database" means is entirely infra-specific.
 Provisioner = Callable[[ProvisionStep], None]
+
+# A notifier performs a `notify` step's work (e.g. posting to Slack, sending
+# an email) for one event. Registered by the caller — see InstallDriver's
+# `notifiers` argument — same reasoning as Provisioner: what "notify" means
+# is entirely operator-specific, and the destination must never come from
+# the artifact itself (see agent.notifiers's module docstring).
+Notifier = Callable[[NotifyStep], None]
 
 
 @dataclass
@@ -128,12 +139,14 @@ class InstallDriver:
         supervisor: Supervisor | None = None,
         *,
         provisioners: dict[str, Provisioner] | None = None,
+        notifiers: dict[str, Notifier] | None = None,
         manifest: ProjectManifest | None = None,
         plugin_secret_key: bytes | None = None,
     ) -> None:
         self.layout = layout
         self._supervisor = supervisor or NullSupervisor()
         self._provisioners = provisioners or {}
+        self._notifiers = notifiers or {}
         # Set by DeploymentRunner once manifest.json has been parsed and
         # verified — used to validate required environment variables in
         # write_env(). None in tests/callers that don't need that check.
@@ -191,6 +204,20 @@ class InstallDriver:
                 "backing service is infra-specific, so there is no generic default"
             )
         provisioner(step)
+
+    def notify(self, step: NotifyStep) -> None:
+        """Best-effort, unlike `provision`: notifying is a side channel, not
+        part of what makes a deployment succeed or fail (same reasoning as
+        MarketplaceClient.report_deployment — see its docstring) — a missing
+        or failing notifier is logged and swallowed, never raised."""
+        notifier = self._notifiers.get(step.event)
+        if notifier is None:
+            logger.debug("no notifier registered for event %r — skipping", step.event)
+            return
+        try:
+            notifier(step)
+        except Exception as exc:
+            logger.warning("notifier for event %r failed: %s", step.event, exc)
 
     def install_plugin(self, step: InstallPluginStep) -> None:
         source = self.layout.extracted_root / self.layout.plugins_dirname / step.plugin

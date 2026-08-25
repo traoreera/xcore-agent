@@ -92,7 +92,18 @@ class MarketplaceClient:
     ) -> None:
         self._api_key = api_key
         self._client = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"), timeout=timeout, transport=transport
+            base_url=base_url.rstrip("/"),
+            timeout=timeout,
+            transport=transport,
+            # See HttpHubClient's identical setting for why — an unfollowed
+            # HTTP->HTTPS redirect silently truncates a response to its
+            # ~17-byte "Moved Permanently" body instead of raising, which
+            # then fails signature verification with no hint that a
+            # redirect (not a bad signature) was the real cause. No
+            # security cost here either: every response this client trusts
+            # is authenticated by content (HMAC-SHA256 over the fetched
+            # bytes), not by transport.
+            follow_redirects=True,
         )
 
     async def __aenter__(self) -> "MarketplaceClient":

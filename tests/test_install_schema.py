@@ -160,3 +160,45 @@ def test_invalid_step_id_is_rejected():
     bad = {**VALID_PLAN, "steps": [{"id": "Not Valid!", "action": "prepare"}]}
     with pytest.raises(ValidationError):
         InstallPlan.model_validate(bad)
+
+
+def test_notify_step_parses():
+    plan = InstallPlan.model_validate(
+        {
+            "format_version": "1",
+            "project_id": "prj_01JXYZ",
+            "version": "1.0.0",
+            "steps": [
+                {
+                    "id": "notify_ops",
+                    "action": "notify",
+                    "event": "deploy_success",
+                    "message": "auth deployed",
+                },
+            ],
+        }
+    )
+    step = plan.step("notify_ops")
+    assert step.action == "notify"
+    assert step.event == "deploy_success"
+    assert step.message == "auth deployed"
+
+
+def test_notify_step_message_is_optional():
+    plan = InstallPlan.model_validate(
+        {
+            **VALID_PLAN,
+            "steps": [{"id": "notify_ops", "action": "notify", "event": "deploy_success"}],
+        }
+    )
+    assert plan.step("notify_ops").message is None
+
+
+def test_notify_step_rejects_invalid_event():
+    with pytest.raises(ValidationError, match="invalid notify event"):
+        InstallPlan.model_validate(
+            {
+                **VALID_PLAN,
+                "steps": [{"id": "notify_ops", "action": "notify", "event": "Not Valid!"}],
+            }
+        )

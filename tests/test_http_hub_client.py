@@ -102,6 +102,33 @@ async def test_download_returns_raw_bytes_from_arbitrary_url():
     assert data == b"raw-artifact-bytes"
 
 
+async def test_download_follows_redirect_instead_of_returning_its_body():
+    # Real prod: download_url came back as http:// while the Hub is
+    # HTTPS-only — the reverse proxy 301s to https://. Without follow_
+    # redirects=True, download() silently returned the redirect's ~17-byte
+    # "Moved Permanently" body as if it were the artifact, which then failed
+    # signature verification with no hint that a redirect was the real cause.
+    def handler(request):
+        if str(request.url) == "http://blob.example/artifact.enc":
+            return httpx.Response(
+                301, headers={"Location": "https://blob.example/artifact.enc"}
+            )
+        assert str(request.url) == "https://blob.example/artifact.enc"
+        return httpx.Response(200, content=b"raw-artifact-bytes")
+
+    async with HttpHubClient(
+        "https://hub.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        location = ArtifactLocation(
+            download_url="http://blob.example/artifact.enc",
+            signature=b"x",
+            signer_public_key=b"y",
+        )
+        data = await client.download(location)
+
+    assert data == b"raw-artifact-bytes"
+
+
 async def test_obtain_deployment_key_roundtrips_base64():
     dek = b"0" * 32
 

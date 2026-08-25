@@ -273,7 +273,24 @@ class HttpHubClient:
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._client = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"), timeout=timeout, transport=transport
+            base_url=base_url.rstrip("/"),
+            timeout=timeout,
+            transport=transport,
+            # `download_url` (from request_artifact) has come back as a bare
+            # `http://` URL in production while the Hub itself is HTTPS-only
+            # — the reverse proxy 301s to https://, and httpx does NOT
+            # follow redirects by default. Without this, `download()` was
+            # silently returning the redirect response's ~17-byte HTML body
+            # ("Moved Permanently") instead of the artifact, which then
+            # failed signature verification with no indication that the
+            # actual problem was a followed-nowhere redirect, not a bad
+            # signature. Real artifacts should never redirect again after
+            # this, but there is no security cost to allowing it either:
+            # every response we actually trust is authenticated by content
+            # (Ed25519 signature over the downloaded bytes, HMAC for the
+            # marketplace) rather than by transport, so a redirect changes
+            # where the bytes came from, never whether they're trusted.
+            follow_redirects=True,
         )
 
     async def __aenter__(self) -> "HttpHubClient":

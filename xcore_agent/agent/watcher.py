@@ -14,7 +14,7 @@ from ..plugin_resolver import PluginResolver
 from ..schema.manifest import ProjectManifest
 from .gc import GarbageCollector
 from .hub_client import DeploymentReport, HubClient
-from .install_driver import Layout, Provisioner, Supervisor
+from .install_driver import Layout, Notifier, Provisioner, Supervisor
 from .pipeline import DeploymentCredentials, DeploymentRunner
 from .state_store import StateStore
 
@@ -39,6 +39,7 @@ class Watcher:
         supervisor: Supervisor | None = None,
         plugin_resolver: PluginResolver | None = None,
         provisioners: dict[str, Provisioner] | None = None,
+        notifiers: dict[str, Notifier] | None = None,
     ) -> None:
         self._hub = hub
         self._credentials = credentials
@@ -49,6 +50,7 @@ class Watcher:
         self._supervisor = supervisor
         self._plugin_resolver = plugin_resolver
         self._provisioners = provisioners
+        self._notifiers = notifiers
         self._state = StateStore(project_root)
 
     async def check_once(self) -> WatchResult:
@@ -72,6 +74,7 @@ class Watcher:
             trusted_signer_public_key=self._trusted_signer_public_key,
             plugin_resolver=self._plugin_resolver,
             provisioners=self._provisioners,
+            notifiers=self._notifiers,
         )
         report = await runner.run()
         self._state.write(project_id=self._credentials.project_id, version=latest)

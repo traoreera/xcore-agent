@@ -26,6 +26,7 @@ from ..schema.install import (
     InstallExtensionStep,
     InstallPlan,
     InstallPluginStep,
+    NotifyStep,
     PrepareStep,
     ProvisionStep,
     RestartStep,
@@ -34,11 +35,20 @@ from ..schema.install import (
     StopStep,
     WriteEnvStep,
 )
-from ..schema.manifest import ProjectManifest
+from ..schema.manifest import PluginSource, ProjectManifest
 from .errors import ArtifactError, DeploymentError
 from .hub_client import ArtifactLocation, DeploymentReport, HubClient, Session
-from .install_driver import InstallDriver, Layout, Provisioner
+from .install_driver import InstallDriver, Layout, Notifier, Provisioner
 from .state import TERMINAL_STATES, TRANSITIONS, DeploymentState
+
+def _describe_source(source: PluginSource) -> str:
+    """Human-readable origin for an error message — marketplace slug@version
+    or git url@ref, whichever `source` actually carries (see `PluginSource`'s
+    docstring: exactly one of the two is ever set)."""
+    if source.marketplace_slug is not None:
+        return f"marketplace:{source.marketplace_slug}@{source.marketplace_version}"
+    return f"{source.url}@{source.ref}"
+
 
 _MANIFEST_FILENAME = "manifest.json"
 _INSTALL_PLAN_PATH = "deployment/install.yaml"
@@ -62,6 +72,10 @@ class DeploymentRunner:
     driver: InstallDriver | None = None
     plugin_resolver: PluginResolver | None = None
     provisioners: dict[str, Provisioner] | None = None
+    # Registered `notify` step handlers (event -> Notifier), typically from
+    # `agent.notifiers.load_notifiers_from_config` — see NotifyStep/
+    # InstallDriver.notify. None (default): every notify step is a no-op.
+    notifiers: dict[str, Notifier] | None = None
     # The target host's own `plugins.secret_key` (integration.yaml) — signs
     # any `execution_mode: trusted` plugin at install time so this host's
     # strict_trusted verification (xcore.kernel.security.signature) can
@@ -82,6 +96,7 @@ class DeploymentRunner:
                     extracted_root=self.workdir / "extracted",
                 ),
                 provisioners=self.provisioners,
+                notifiers=self.notifiers,
                 plugin_secret_key=self.plugin_secret_key,
             )
 
@@ -104,7 +119,7 @@ class DeploymentRunner:
             self._extract(compressed_tar)
             self._verify_manifest()
             self._validate_project()
-            self._resolve_plugins()
+            await self._resolve_plugins()
             order = self._resolve_sequence()
             self._install(order)
             self._healthcheck()
@@ -200,7 +215,20 @@ class DeploymentRunner:
             raise ArtifactError(f"failed to decompress artifact: {exc}") from exc
 
         extracted_root = self.workdir / "extracted"
-        extracted_root.mkdir(parents=True, exist_ok=True)
+        # A retried/resumed deployment reuses this same workdir (see the
+        # module docstring — caching is the point). Wipe it first: real
+        # prod bug, hit deploying this exact multi-plugin artifact for the
+        # first time — a prior attempt that got partway through
+        # `_resolve_plugins` before failing later (e.g. one plugin fetched
+        # fine, a different one 400'd) leaves its resolved/merged files
+        # sitting here. Extracting on top of that (tar extraction never
+        # deletes what it doesn't overwrite) left extra files behind that
+        # `_verify_manifest`'s re-hash — which runs BEFORE `_resolve_plugins`
+        # on this new attempt — then sees, causing a content hash mismatch
+        # against a manifest describing the pristine, un-resolved tree.
+        if extracted_root.exists():
+            shutil.rmtree(extracted_root)
+        extracted_root.mkdir(parents=True)
         archive_path = self.workdir / "artifact.tar"
         archive_path.write_bytes(plaintext_tar)
         with tarfile.open(archive_path, "r:") as tf:
@@ -249,7 +277,7 @@ class DeploymentRunner:
                 f"requested version {self.version!r}"
             )
 
-    def _resolve_plugins(self) -> None:
+    async def _resolve_plugins(self) -> None:
         """Fetch any plugin OR extension the manifest references by `source`
         (a git repo, typically handed out by a marketplace/registry) rather
         than embeds, materializing it into `extracted_root/plugins/<id>/`
@@ -268,18 +296,19 @@ class DeploymentRunner:
                 continue
             if self.plugin_resolver is None:
                 raise ArtifactError(
-                    f"plugin {plugin.id!r} is resolved from {plugin.source.url!r} but no "
-                    "plugin_resolver was configured for this deployment"
+                    f"plugin {plugin.id!r} is resolved from "
+                    f"{_describe_source(plugin.source)} but no plugin_resolver was "
+                    "configured for this deployment"
                 )
 
-            resolved = self.plugin_resolver.resolve(plugin.id, plugin.source)
+            resolved = await self.plugin_resolver.resolve(plugin.id, plugin.source)
             if plugin.sha256 is not None:
                 actual = crypto.compute_tree_digest(resolved)
                 if actual != plugin.sha256:
                     raise ArtifactError(
                         f"plugin {plugin.id!r}: resolved content hash mismatch "
                         f"(manifest declares {plugin.sha256}, computed {actual}) — "
-                        f"{plugin.source.url}@{plugin.source.ref} does not match what was built"
+                        f"{_describe_source(plugin.source)} does not match what was built"
                     )
 
             # Merge onto whatever's already extracted there — NOT a
@@ -312,22 +341,23 @@ class DeploymentRunner:
                 continue
             if self.plugin_resolver is None:
                 raise ArtifactError(
-                    f"extension {extension.id!r} is resolved from {extension.source.url!r} but "
-                    "no plugin_resolver was configured for this deployment"
+                    f"extension {extension.id!r} is resolved from "
+                    f"{_describe_source(extension.source)} but no plugin_resolver was "
+                    "configured for this deployment"
                 )
 
             # Namespaced ("ext-<id>") so a plugin and an extension sharing
             # the same id (they install to different target directories —
             # see Layout.plugin_dir vs extension_dir) don't collide in
             # PluginResolver's cache, which is keyed on the id string alone.
-            resolved = self.plugin_resolver.resolve(f"ext-{extension.id}", extension.source)
+            resolved = await self.plugin_resolver.resolve(f"ext-{extension.id}", extension.source)
             if extension.sha256 is not None:
                 actual = crypto.compute_tree_digest(resolved)
                 if actual != extension.sha256:
                     raise ArtifactError(
                         f"extension {extension.id!r}: resolved content hash mismatch "
                         f"(manifest declares {extension.sha256}, computed {actual}) — "
-                        f"{extension.source.url}@{extension.source.ref} does not match "
+                        f"{_describe_source(extension.source)} does not match "
                         "what was built"
                     )
 
@@ -369,6 +399,8 @@ class DeploymentRunner:
             self.driver.configure_plugin(step)
         elif isinstance(step, WriteEnvStep):
             self.driver.write_env(step)
+        elif isinstance(step, NotifyStep):
+            self.driver.notify(step)
         elif isinstance(step, StartStep):
             self.driver.start(step)
         elif isinstance(step, StopStep):

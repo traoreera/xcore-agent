@@ -1,6 +1,7 @@
 """Command-line entry point for xcore-agent."""
 
 import asyncio
+import contextlib
 import socket
 from enum import Enum
 from pathlib import Path
@@ -20,6 +21,7 @@ from .agent.marketplace_client import MarketplaceClient
 from .agent.marketplace_pipeline import MarketplaceDeploymentReport, MarketplaceDeploymentRunner
 from .agent.marketplace_watcher import MarketplaceWatcher, MarketplaceWatchResult
 from .agent.pipeline import DeploymentCredentials, DeploymentRunner
+from .agent.notifiers import load_notifiers_from_config
 from .agent.provisioners import load_provisioners_from_config
 from .agent.systemd_supervisor import SystemdSupervisor
 from .agent.watcher import Watcher, WatchResult
@@ -350,14 +352,43 @@ def deploy(
     git_token: list[str] = typer.Option(
         [],
         help="HOST=TOKEN for a private git host a source-based plugin may need "
-        "to authenticate against (repeatable). Public repos and SSH URLs "
-        "need none of this.",
+        "to authenticate against (repeatable) — only used for a plugin/extension "
+        "whose 'source:' is a git fallback (see PluginSource), not a marketplace "
+        "slug. Public repos and SSH URLs need none of this.",
+    ),
+    marketplace_url: str = typer.Option(
+        "https://marketplace.xcorehub.dev",
+        envvar="XCORE_MARKETPLACE_URL",
+        help="Marketplace root (no /app/... segment), used to resolve any plugin/"
+        "extension whose 'source:' is a marketplace slug — see `deploy-marketplace "
+        "--help` for the shape of this URL. Irrelevant if every plugin in this "
+        "project is either embedded or git-sourced.",
+    ),
+    marketplace_api_key: str = typer.Option(
+        None,
+        envvar="XCORE_MARKETPLACE_API_KEY",
+        help="xdevkeys API key (xdk_...), required only if some plugin/extension "
+        "in this project has a marketplace-slug 'source:' (the default xcli "
+        "records for anything installed via `xcli plugin install`).",
+    ),
+    marketplace_signing_secret: str = typer.Option(
+        None,
+        envvar="XCORE_MARKETPLACE_SIGNING_SECRET",
+        help="HMAC signing secret verifying marketplace-sourced plugins/extensions "
+        "(see `deploy-marketplace --help`) — required alongside --marketplace-api-key "
+        "whenever this project has one.",
     ),
     provisioners_config: Path = typer.Option(
         None,
         help="YAML file mapping plugin id -> {command, env, timeout} for the "
         "'provision' action — see agent/provisioners.py. Omit if no plugin "
         "in this project uses 'provision'.",
+    ),
+    notifiers_config: Path = typer.Option(
+        None,
+        help="YAML file mapping event -> {command, env, timeout} for the "
+        "'notify' action — see agent/notifiers.py. Omit if no step in this "
+        "project's install.yaml uses 'notify'.",
     ),
     plugin_secret_key: str = typer.Option(
         None,
@@ -378,19 +409,32 @@ def deploy(
     """
     workdir = Path.home() / ".cache" / "xcore-agent" / project_id / version
     workdir.mkdir(parents=True, exist_ok=True)
-    plugin_resolver = PluginResolver(
-        cache_root=Path.home() / ".cache" / "xcore-agent" / "plugins",
-        git_credentials=_parse_git_tokens(git_token),
-    )
     provisioners = (
         load_provisioners_from_config(provisioners_config)
         if provisioners_config is not None
         else None
     )
+    notifiers = (
+        load_notifiers_from_config(notifiers_config) if notifiers_config is not None else None
+    )
     runner_holder: dict[str, DeploymentRunner] = {}
 
     async def _run() -> DeploymentReport:
-        async with HttpHubClient(hub_url) as hub:
+        async with contextlib.AsyncExitStack() as stack:
+            hub = await stack.enter_async_context(HttpHubClient(hub_url))
+            marketplace_client = None
+            if marketplace_api_key:
+                marketplace_client = await stack.enter_async_context(
+                    MarketplaceClient(marketplace_url, api_key=marketplace_api_key)
+                )
+            plugin_resolver = PluginResolver(
+                cache_root=Path.home() / ".cache" / "xcore-agent" / "plugins",
+                git_credentials=_parse_git_tokens(git_token),
+                marketplace_client=marketplace_client,
+                trusted_signer_secret=(
+                    marketplace_signing_secret.encode() if marketplace_signing_secret else None
+                ),
+            )
             runner = DeploymentRunner(
                 hub=hub,
                 credentials=DeploymentCredentials(
@@ -404,6 +448,7 @@ def deploy(
                 trusted_signer_public_key=signer_public_key.read_bytes(),
                 plugin_resolver=plugin_resolver,
                 provisioners=provisioners,
+                notifiers=notifiers,
                 plugin_secret_key=plugin_secret_key.encode() if plugin_secret_key else None,
             )
             runner_holder["runner"] = runner
@@ -466,6 +511,11 @@ def deploy_marketplace(
         help="YAML file mapping plugin id -> {command, env, timeout} for the "
         "'provision' action — see agent/provisioners.py.",
     ),
+    notifiers_config: Path = typer.Option(
+        None,
+        help="YAML file mapping event -> {command, env, timeout} for the "
+        "'notify' action — see agent/notifiers.py.",
+    ),
     plugin_secret_key: str = typer.Option(
         None,
         envvar="XCORE_PLUGIN_SECRET",
@@ -487,6 +537,9 @@ def deploy_marketplace(
         if provisioners_config is not None
         else None
     )
+    notifiers = (
+        load_notifiers_from_config(notifiers_config) if notifiers_config is not None else None
+    )
     runner_holder: dict[str, MarketplaceDeploymentRunner] = {}
 
     async def _run() -> MarketplaceDeploymentReport:
@@ -502,6 +555,7 @@ def deploy_marketplace(
                 kind=kind.value,
                 host_id=resolved_host_id,
                 provisioners=provisioners,
+                notifiers=notifiers,
                 plugin_secret_key=plugin_secret_key.encode() if plugin_secret_key else None,
             )
             runner_holder["runner"] = runner
@@ -574,6 +628,11 @@ def watch_marketplace(
         help="YAML file mapping plugin id -> {command, env, timeout} for the "
         "'provision' action — see agent/provisioners.py.",
     ),
+    notifiers_config: Path = typer.Option(
+        None,
+        help="YAML file mapping event -> {command, env, timeout} for the "
+        "'notify' action — see agent/notifiers.py.",
+    ),
 ) -> None:
     """Poll the real xcore-team/marketplace for a new version of one plugin
     or extension and redeploy automatically when it appears — the CI/CD loop
@@ -586,6 +645,9 @@ def watch_marketplace(
         load_provisioners_from_config(provisioners_config)
         if provisioners_config is not None
         else None
+    )
+    notifiers = (
+        load_notifiers_from_config(notifiers_config) if notifiers_config is not None else None
     )
 
     def _report(result: MarketplaceWatchResult) -> None:
@@ -617,6 +679,7 @@ def watch_marketplace(
                     k8s_context=k8s_context,
                 ),
                 provisioners=provisioners,
+                notifiers=notifiers,
             )
             if once:
                 return await watcher.check_once()
@@ -666,13 +729,39 @@ def watch(
     git_token: list[str] = typer.Option(
         [],
         help="HOST=TOKEN for a private git host a source-based plugin may need "
-        "to authenticate against (repeatable). Public repos and SSH URLs "
-        "need none of this.",
+        "to authenticate against (repeatable) — only used for a plugin/extension "
+        "whose 'source:' is a git fallback (see PluginSource), not a marketplace "
+        "slug. Public repos and SSH URLs need none of this.",
+    ),
+    marketplace_url: str = typer.Option(
+        "https://marketplace.xcorehub.dev",
+        envvar="XCORE_MARKETPLACE_URL",
+        help="Marketplace root (no /app/... segment), used to resolve any plugin/"
+        "extension whose 'source:' is a marketplace slug. Irrelevant if every "
+        "plugin in this project is either embedded or git-sourced.",
+    ),
+    marketplace_api_key: str = typer.Option(
+        None,
+        envvar="XCORE_MARKETPLACE_API_KEY",
+        help="xdevkeys API key (xdk_...), required only if some plugin/extension "
+        "in this project has a marketplace-slug 'source:' (the default xcli "
+        "records for anything installed via `xcli plugin install`).",
+    ),
+    marketplace_signing_secret: str = typer.Option(
+        None,
+        envvar="XCORE_MARKETPLACE_SIGNING_SECRET",
+        help="HMAC signing secret verifying marketplace-sourced plugins/extensions — "
+        "required alongside --marketplace-api-key whenever this project has one.",
     ),
     provisioners_config: Path = typer.Option(
         None,
         help="YAML file mapping plugin id -> {command, env, timeout} for the "
         "'provision' action — see agent/provisioners.py.",
+    ),
+    notifiers_config: Path = typer.Option(
+        None,
+        help="YAML file mapping event -> {command, env, timeout} for the "
+        "'notify' action — see agent/notifiers.py.",
     ),
 ) -> None:
     """Poll XCore Hub for a new version/tag and redeploy automatically when
@@ -680,14 +769,13 @@ def watch(
     snapshots + cached downloads) after every successful redeploy. Requires
     a live Hub API — not available yet (see agent.hub_client.HttpHubClient)."""
     workdir_root = Path.home() / ".cache" / "xcore-agent" / project_id
-    plugin_resolver = PluginResolver(
-        cache_root=Path.home() / ".cache" / "xcore-agent" / "plugins",
-        git_credentials=_parse_git_tokens(git_token),
-    )
     provisioners = (
         load_provisioners_from_config(provisioners_config)
         if provisioners_config is not None
         else None
+    )
+    notifiers = (
+        load_notifiers_from_config(notifiers_config) if notifiers_config is not None else None
     )
 
     def _report(result: WatchResult) -> None:
@@ -700,7 +788,21 @@ def watch(
         console.print(f"[red]Check failed:[/red] {exc}")
 
     async def _watch() -> WatchResult | None:
-        async with HttpHubClient(hub_url) as hub:
+        async with contextlib.AsyncExitStack() as stack:
+            hub = await stack.enter_async_context(HttpHubClient(hub_url))
+            marketplace_client = None
+            if marketplace_api_key:
+                marketplace_client = await stack.enter_async_context(
+                    MarketplaceClient(marketplace_url, api_key=marketplace_api_key)
+                )
+            plugin_resolver = PluginResolver(
+                cache_root=Path.home() / ".cache" / "xcore-agent" / "plugins",
+                git_credentials=_parse_git_tokens(git_token),
+                marketplace_client=marketplace_client,
+                trusted_signer_secret=(
+                    marketplace_signing_secret.encode() if marketplace_signing_secret else None
+                ),
+            )
             watcher = Watcher(
                 hub=hub,
                 credentials=DeploymentCredentials(
@@ -721,6 +823,7 @@ def watch(
                 ),
                 plugin_resolver=plugin_resolver,
                 provisioners=provisioners,
+                notifiers=notifiers,
             )
             if once:
                 return await watcher.check_once()

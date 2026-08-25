@@ -22,7 +22,7 @@ from xcore_agent.agent.errors import ArtifactError, DeploymentError
 from xcore_agent.agent.hub_client import InMemoryHubClient
 from xcore_agent.agent.pipeline import DeploymentCredentials, DeploymentRunner
 from xcore_agent.agent.state import DeploymentState
-from xcore_agent.packer.builder import _read_plugins_dirname, seal_directory, write_manifest
+from xcore_agent.packer.builder import build_artifact, seal_directory, write_manifest
 from xcore_agent.plugin_resolver import PluginResolver
 
 PROJECT_ID = "prj_test0000001"
@@ -62,23 +62,33 @@ def _build_source_tree(root: Path, *, extra_steps: list[dict] | None = None) -> 
 
 
 def _seal(root: Path) -> dict:
-    """Write manifest.json and seal `root` with the real packer. Resolves
-    `plugins_dirname` from integration.yaml the same way `build_artifact`
-    does, so a source tree using a non-default plugins directory (see
-    test_full_pipeline_with_custom_plugins_directory) seals correctly."""
-    write_manifest(
+    """Build+seal `root` via the real, complete `build_artifact` entry
+    point — NOT a hand-rolled write_manifest()+seal_directory() shortcut.
+    That used to skip `_prepare_packaging_view`'s pruning of source-based
+    plugins/extensions down to just their manifest file, which let
+    content_sha256 and the actually-sealed tree agree for the wrong
+    reason (both silently included files a real build would have pruned,
+    instead of both correctly excluding them) — invisible until
+    content_sha256 started accounting for that pruning for real. See
+    test_source_based_plugin_is_resolved_from_git."""
+    output_path = root.parent / f"{root.name}-sealed.xdeploy.enc"
+    result = build_artifact(
         root,
         project_id=PROJECT_ID,
         project_name="demo-project",
         version="1.0.0",
-        plugins_dirname=_read_plugins_dirname(root),
+        output_path=output_path,
     )
-    ciphertext, dek, signature, public_key = seal_directory(root)
-    return {"encrypted": ciphertext, "dek": dek, "signature": signature, "public_key": public_key}
+    return {
+        "encrypted": output_path.read_bytes(),
+        "dek": result.dek,
+        "signature": result.signature,
+        "public_key": result.signer_public_key,
+    }
 
 
 def _make_runner(
-    tmp_path: Path, sealed: dict, *, plugin_resolver=None
+    tmp_path: Path, sealed: dict, *, plugin_resolver=None, notifiers=None
 ) -> tuple[DeploymentRunner, InMemoryHubClient]:
     hub = InMemoryHubClient(
         ciphertext=sealed["encrypted"],
@@ -96,6 +106,7 @@ def _make_runner(
         project_root=tmp_path / "deployed",
         trusted_signer_public_key=sealed["public_key"],
         plugin_resolver=plugin_resolver,
+        notifiers=notifiers,
     )
     return runner, hub
 
@@ -123,6 +134,33 @@ async def test_full_pipeline_succeeds(tmp_path, sealed_artifact):
     env_file = runner.project_root / "plugins" / "demo.env"
     assert env_file.is_file()
     assert oct(env_file.stat().st_mode)[-3:] == "600"
+
+
+async def test_full_pipeline_dispatches_notify_step(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    _build_source_tree(
+        src,
+        extra_steps=[
+            {
+                "id": "notify_ops",
+                "action": "notify",
+                "event": "deploy_success",
+                "message": "demo deployed",
+                "depends_on": ["start"],
+            }
+        ],
+    )
+    sealed = _seal(src)
+
+    calls = []
+    runner, hub = _make_runner(tmp_path, sealed, notifiers={"deploy_success": calls.append})
+    report = await runner.run()
+
+    assert report.status == "success"
+    assert len(calls) == 1
+    assert calls[0].event == "deploy_success"
+    assert calls[0].message == "demo deployed"
 
 
 async def test_full_pipeline_with_custom_plugins_directory(tmp_path):
@@ -254,6 +292,16 @@ async def test_project_id_mismatch_is_rejected(tmp_path, sealed_artifact):
 
 
 async def test_install_failure_triggers_rollback(tmp_path):
+    # Deliberately bypasses _seal() (real build_artifact): an install.yaml
+    # step referencing a plugin absent from plugins/ is now rejected at
+    # BUILD time (_validate_source_tree) — exactly the safety net that
+    # SHOULD stop a well-behaved packer from ever producing this artifact.
+    # What this test actually exercises is the AGENT's defensive handling
+    # (install_driver.install_plugin's "not found in extracted artifact")
+    # for the case where one somehow reaches it anyway — a hand-assembled
+    # manifest/install.yaml combination that skips that build-time check,
+    # same reasoning as test_path_traversal_in_archive_is_rejected
+    # deliberately not going through the packer at all.
     src = tmp_path / "src"
     src.mkdir()
     _build_source_tree(
@@ -267,7 +315,11 @@ async def test_install_failure_triggers_rollback(tmp_path):
             }
         ],
     )
-    sealed = _seal(src)
+    write_manifest(
+        src, project_id=PROJECT_ID, project_name="demo-project", version="1.0.0"
+    )
+    ciphertext, dek, signature, public_key = seal_directory(src)
+    sealed = {"encrypted": ciphertext, "dek": dek, "signature": signature, "public_key": public_key}
     runner, _hub = _make_runner(tmp_path, sealed)
 
     with pytest.raises(DeploymentError, match="install failed"):
@@ -351,6 +403,86 @@ def _build_source_based_project(tmp_path: Path) -> tuple[Path, str]:
     }
     (src / "deployment" / "install.yaml").write_text(yaml.safe_dump(install_plan))
     return src, sha
+
+
+async def test_retried_deploy_after_partial_resolve_failure_reextracts_cleanly(tmp_path):
+    # Real prod bug, hit deploying a multi-plugin artifact for the first
+    # time: a deploy that resolves plugin A fine, then fails resolving
+    # plugin B (a transient marketplace/git error), leaves A's real merged
+    # code sitting in the reused workdir's extracted/ tree. _extract() used
+    # to only ever ADD to that directory (tar extraction never deletes what
+    # it doesn't overwrite) — so a retried deploy's _verify_manifest (which
+    # runs BEFORE _resolve_plugins) saw A's leftover files and rejected the
+    # artifact with a content hash mismatch, even though the artifact
+    # itself was perfectly fine.
+    good_repo = tmp_path / "good-repo"
+    good_repo.mkdir()
+    _git("init", "--quiet", cwd=good_repo)
+    _git("config", "user.email", "test@test.com", cwd=good_repo)
+    _git("config", "user.name", "test", cwd=good_repo)
+    (good_repo / "main.py").write_text("# good plugin\n")
+    _git("add", "-A", cwd=good_repo)
+    _git("commit", "--quiet", "-m", "initial", cwd=good_repo)
+    good_sha = _git("rev-parse", "HEAD", cwd=good_repo).stdout.strip()
+
+    src = tmp_path / "src"
+    # "good" sorts before "zzz_flaky" — write_manifest lists plugins/
+    # alphabetically, and _resolve_plugins processes them in that order, so
+    # "good" resolves (and merges real files) before "zzz_flaky" fails.
+    (src / "plugins" / "good").mkdir(parents=True)
+    (src / "plugins" / "zzz_flaky").mkdir(parents=True)
+    (src / "deployment").mkdir(parents=True)
+    (src / "integration.yaml").write_text("services: {}\n")
+    (src / "plugins" / "good" / "plugin.yaml").write_text(
+        f"name: good\nversion: 1.0.0\nsource:\n  url: file://{good_repo}\n  ref: {good_sha}\n"
+    )
+    (src / "plugins" / "zzz_flaky" / "plugin.yaml").write_text(
+        f"name: zzz_flaky\nversion: 1.0.0\nsource:\n  url: file://{good_repo}\n  ref: {good_sha}\n"
+    )
+    install_plan = {
+        "format_version": "1",
+        "project_id": PROJECT_ID,
+        "version": "1.0.0",
+        "steps": [
+            {"id": "prepare", "action": "prepare"},
+            {"id": "install_good", "action": "install_plugin", "plugin": "good"},
+            {"id": "install_flaky", "action": "install_plugin", "plugin": "zzz_flaky"},
+        ],
+    }
+    (src / "deployment" / "install.yaml").write_text(yaml.safe_dump(install_plan))
+    sealed = _seal(src)
+
+    class _FlakyResolver:
+        """Fails resolving "zzz_flaky" exactly once, succeeds every other
+        call (including for "good", and for "zzz_flaky" on retry) —
+        delegates to a real PluginResolver so resolution genuinely happens."""
+
+        def __init__(self, cache_root: Path) -> None:
+            self._real = PluginResolver(cache_root=cache_root)
+            self.flaky_calls = 0
+
+        async def resolve(self, plugin_id: str, source):
+            if plugin_id == "zzz_flaky":
+                self.flaky_calls += 1
+                if self.flaky_calls == 1:
+                    raise ArtifactError("simulated transient resolution failure")
+            return await self._real.resolve(plugin_id, source)
+
+    resolver = _FlakyResolver(tmp_path / "plugin-cache")
+
+    runner1, _hub1 = _make_runner(tmp_path, sealed, plugin_resolver=resolver)
+    with pytest.raises(ArtifactError, match="simulated transient"):
+        await runner1.run()
+
+    # Confirm the setup actually reproduces the bug precondition: "good"'s
+    # real code is sitting in the (reused) workdir's extracted tree.
+    leftover = runner1.workdir / "extracted" / "plugins" / "good" / "main.py"
+    assert leftover.is_file()
+
+    runner2, _hub2 = _make_runner(tmp_path, sealed, plugin_resolver=resolver)
+    report = await runner2.run()
+
+    assert report.status == "success"
 
 
 async def test_source_based_plugin_is_resolved_from_git(tmp_path):

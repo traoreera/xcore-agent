@@ -15,6 +15,7 @@ from xcore_agent.agent.plugin_signing import SIG_FILENAME
 from xcore_agent.schema.install import (
     InstallExtensionStep,
     InstallPluginStep,
+    NotifyStep,
     ProvisionStep,
     WriteEnvStep,
 )
@@ -55,6 +56,35 @@ def test_provision_calls_registered_provisioner(tmp_path):
     driver.provision(step)
 
     assert calls == [step]
+
+
+def test_notify_without_registered_notifier_is_a_silent_no_op(tmp_path):
+    # Unlike provision (infra-critical, fails hard), a missing notifier
+    # must never fail the deployment — notifying is a side channel.
+    driver = InstallDriver(_layout(tmp_path))
+    step = NotifyStep(id="notify_demo", action="notify", event="deploy_success")
+
+    driver.notify(step)  # must not raise
+
+
+def test_notify_calls_registered_notifier(tmp_path):
+    calls = []
+    driver = InstallDriver(_layout(tmp_path), notifiers={"deploy_success": calls.append})
+    step = NotifyStep(id="notify_demo", action="notify", event="deploy_success", message="ok")
+
+    driver.notify(step)
+
+    assert calls == [step]
+
+
+def test_notify_swallows_a_failing_notifier(tmp_path):
+    def _boom(step: NotifyStep) -> None:
+        raise InstallError("webhook unreachable")
+
+    driver = InstallDriver(_layout(tmp_path), notifiers={"deploy_success": _boom})
+    step = NotifyStep(id="notify_demo", action="notify", event="deploy_success")
+
+    driver.notify(step)  # must not raise despite the notifier failing
 
 
 def test_write_env_skips_validation_without_manifest(tmp_path):

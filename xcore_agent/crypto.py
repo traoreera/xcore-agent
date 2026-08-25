@@ -6,6 +6,7 @@ time from XCore Hub (see `agent.hub_client.HubClient.obtain_deployment_key`)
 and kept only in memory for the duration of one deployment.
 """
 
+import fnmatch
 import hashlib
 import hmac as _hmac
 from pathlib import Path
@@ -76,7 +77,12 @@ def decrypt_aes_gcm(
         ) from exc
 
 
-def compute_tree_digest(root: Path, *, exclude: frozenset[str] = frozenset()) -> str:
+def compute_tree_digest(
+    root: Path,
+    *,
+    exclude: frozenset[str] = frozenset(),
+    skip_patterns: tuple[str, ...] = (),
+) -> str:
     """Deterministic digest of every file under `root`, as sha256("relpath:sha256\\n"...).
 
     Used both to produce `manifest.json`'s `content_sha256` at build time and,
@@ -85,11 +91,25 @@ def compute_tree_digest(root: Path, *, exclude: frozenset[str] = frozenset()) ->
     sidesteps the circular problem of a manifest hashing a tarball that
     contains that same manifest (and therefore its own hash) — `manifest.json`
     itself must always be passed in `exclude`.
+
+    `exclude` matches a file's full relative path exactly (what `manifest.json`
+    needs). `skip_patterns` matches by glob against every path *component*
+    (same semantics as `shutil.ignore_patterns`) — for `packer.builder`
+    passing its `_PACKAGING_EXCLUDE_PATTERNS`, so this digest is computed
+    over the same tree `_prepare_packaging_view` actually seals (`.venv`,
+    `.env`, ... never make it into the packaging view, so they must not
+    silently count toward `content_sha256` either — otherwise the manifest
+    would describe a tree that isn't the one inside the artifact).
     """
     entries = []
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
-        rel = path.relative_to(root).as_posix()
+        rel_path = path.relative_to(root)
+        rel = rel_path.as_posix()
         if rel in exclude:
+            continue
+        if skip_patterns and any(
+            fnmatch.fnmatch(part, pattern) for part in rel_path.parts for pattern in skip_patterns
+        ):
             continue
         entries.append(f"{rel}:{sha256_hex(path.read_bytes())}")
     return hashlib.sha256("\n".join(entries).encode("utf-8")).hexdigest()
