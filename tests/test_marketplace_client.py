@@ -115,6 +115,23 @@ async def test_get_latest_version_reads_plugin_detail():
     assert version == "1.2.3"
 
 
+async def test_get_latest_version_sends_api_key():
+    # Real bug: this route only recognized a JWT session server-side, never
+    # an xdevkey — sending no auth here meant a visibility="private" target
+    # 404'd for every xcore-agent caller regardless of whether its key
+    # actually had access. Fixed server-side (xcore-team/marketplace,
+    # xcore-team/xservices) AND here — both halves needed for a private
+    # source to actually work with watch-sources.
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["x-api-key"] == "xdk_test"
+        return _json_response(200, {"slug": "my-plugin", "latest_version": "1.2.3"})
+
+    async with MarketplaceClient(
+        "https://hub.example", api_key="xdk_test", transport=httpx.MockTransport(handler)
+    ) as client:
+        await client.get_latest_version(slug="my-plugin")
+
+
 async def test_get_latest_version_uses_services_path_for_service_kind():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/app/xservices/services/my-ext"
