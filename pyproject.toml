@@ -1,6 +1,6 @@
 [project]
 name = "xcore-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Deployment agent for XCore .xdeploy artifacts — authenticates, downloads, verifies, decrypts, and installs plugin bundles on a target host."
 authors = [
     { name = "InfinityWAB" },

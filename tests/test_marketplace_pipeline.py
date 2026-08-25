@@ -136,6 +136,56 @@ async def test_full_pipeline_succeeds(tmp_path):
     assert reported["host_id"] == "default"
 
 
+async def test_full_pipeline_succeeds_for_service_kind(tmp_path):
+    # Real bug, never caught before: _extract() hardcoded plugins/<slug>
+    # regardless of `kind`, and _dispatch had no case for InstallExtensionStep
+    # at all — a kind="service" deploy silently installed nothing while still
+    # reporting "success" (install_extension was simply never called).
+    zip_bytes = _build_zipball(root_dir_name="acme-demo-service-abc1234")
+    client = FakeMarketplaceClient(
+        zip_bytes=zip_bytes, signature_hex=_sign(zip_bytes), plugin_header="demo-plugin@1.0.0"
+    )
+    plan_path = tmp_path / "install.yaml"
+    plan = {
+        "format_version": "1",
+        "project_id": SLUG,
+        "version": "1.0.0",
+        "steps": [
+            {"id": "prepare", "action": "prepare"},
+            {
+                "id": "install_demo",
+                "action": "install_extension",
+                "extension": SLUG,
+                "snapshot": True,
+            },
+            {"id": "start", "action": "start", "depends_on": ["install_demo"]},
+        ],
+    }
+    plan_path.write_text(yaml.safe_dump(plan))
+
+    runner = MarketplaceDeploymentRunner(
+        client=client,
+        slug=SLUG,
+        workdir=tmp_path / "work",
+        project_root=tmp_path / "deployed",
+        trusted_signer_secret=SECRET,
+        install_plan_path=plan_path,
+        version="1.0.0",
+        kind="service",
+    )
+
+    report = await runner.run()
+
+    assert report.status == "success"
+    assert client.fetch_calls == [(SLUG, "1.0.0", "service")]
+
+    extension_dir = runner.project_root / "extensions" / SLUG
+    assert (extension_dir / "plugin.yaml").is_file()
+    assert (extension_dir / "main.py").is_file()
+    # Not installed under plugins/ (the bug's symptom).
+    assert not (runner.project_root / "plugins" / SLUG).exists()
+
+
 async def test_report_to_hub_uses_configured_host_id(tmp_path):
     zip_bytes = _build_zipball()
     client = FakeMarketplaceClient(

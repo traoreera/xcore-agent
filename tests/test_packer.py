@@ -224,6 +224,273 @@ def test_plugin_missing_plugin_yaml_is_rejected(tmp_path):
         )
 
 
+def test_plugin_declaring_env_inject_without_template_is_rejected(tmp_path):
+    # Real incident this guards against: xauth's plugin.yaml declared
+    # envconfiguration.inject: true with no .env.template anywhere in the
+    # published repo — invisible at build time, only surfaced as a
+    # ManifestError when a real host tried to start the plugin.
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / "demo" / "plugin.yaml").write_text(
+        "name: demo\nversion: 1.0.0\n" "envconfiguration:\n  inject: true\n  env_file: .env\n"
+    )
+
+    with pytest.raises(BuildError, match=r"\.env\.template"):
+        build_artifact(
+            src,
+            project_id=PROJECT_ID,
+            project_name="x",
+            version="1.0.0",
+            output_path=tmp_path / "out.xdeploy.enc",
+        )
+
+
+def test_plugin_declaring_env_inject_with_template_present_succeeds(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / "demo" / "plugin.yaml").write_text(
+        "name: demo\nversion: 1.0.0\n" "envconfiguration:\n  inject: true\n  env_file: .env\n"
+    )
+    (src / "plugins" / "demo" / ".env.template").write_text("SOME_SECRET=${SOME_SECRET}\n")
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    assert result.manifest.plugins[0].id == "demo"
+
+
+def test_env_template_check_skipped_for_source_based_plugin(tmp_path):
+    # Nothing to check on disk for a plugin resolved from git at deploy
+    # time — same reasoning as sha256 being optional for source-based
+    # plugins (see _read_plugin_source).
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / "demo" / "plugin.yaml").write_text(
+        "name: demo\nversion: 1.0.0\n"
+        "envconfiguration:\n  inject: true\n  env_file: .env\n"
+        "source:\n  url: https://github.com/acme/demo.git\n"
+        f"  ref: {'a' * 40}\n"
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    assert result.manifest.plugins[0].source is not None
+
+
+def test_plugin_resolved_from_xcli_registry_marketplace_source(tmp_path):
+    # .xcore-registry.json is written by `xcli plugin install --source
+    # marketplace|git` (xcoreCli) as a sibling of every plugin directory —
+    # a plugin with no source: of its own in plugin.yaml should still be
+    # resolved at deploy time if the registry says how it got here.
+    # Marketplace is the PRIMARY origin (see PluginSource's docstring):
+    # `slug`/`kind`/`version` drive resolution, not the courtesy `X-Repo`
+    # coordinates also recorded alongside them.
+    import json
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / ".xcore-registry.json").write_text(
+        json.dumps(
+            {
+                "demo": {
+                    "source": "marketplace",
+                    "slug": "demo",
+                    "kind": "plugin",
+                    "version": "1.0.0",
+                    "repository": "https://github.com/acme/demo",
+                    "ref": "b" * 40,
+                }
+            }
+        )
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    plugin = result.manifest.plugins[0]
+    assert plugin.source is not None
+    assert plugin.source.marketplace_slug == "demo"
+    assert plugin.source.marketplace_version == "1.0.0"
+    assert plugin.source.marketplace_kind == "plugin"
+    assert plugin.source.url is None
+    assert plugin.sha256 is None  # source-based, nothing embedded to hash
+
+
+def test_plugin_resolved_from_xcli_registry_git_source(tmp_path):
+    # A plugin installed with `xcli plugin install --source git` (never
+    # published to the marketplace) — the fallback origin, see PluginSource.
+    import json
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / ".xcore-registry.json").write_text(
+        json.dumps(
+            {
+                "demo": {
+                    "source": "git",
+                    "slug": "demo",
+                    "kind": "plugin",
+                    "version": None,
+                    "repository": "https://github.com/acme/demo",
+                    "ref": "b" * 40,
+                }
+            }
+        )
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    plugin = result.manifest.plugins[0]
+    assert plugin.source is not None
+    assert plugin.source.marketplace_slug is None
+    assert plugin.source.url == "https://github.com/acme/demo"
+    assert plugin.source.ref == "b" * 40
+    assert plugin.sha256 is None  # source-based, nothing embedded to hash
+
+
+def test_explicit_plugin_yaml_source_wins_over_registry(tmp_path):
+    import json
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / "demo" / "plugin.yaml").write_text(
+        "name: demo\nversion: 1.0.0\nsource:\n  url: https://github.com/explicit/demo.git\n"
+        f"  ref: {'c' * 40}\n"
+    )
+    (src / "plugins" / ".xcore-registry.json").write_text(
+        json.dumps(
+            {
+                "demo": {
+                    "source": "marketplace",
+                    "repository": "https://github.com/registry/demo",
+                    "ref": "d" * 40,
+                }
+            }
+        )
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    assert result.manifest.plugins[0].source.url == "https://github.com/explicit/demo.git"
+
+
+def test_registry_entry_missing_slug_falls_back_to_embedding(tmp_path):
+    # A 'marketplace' entry with no `slug` — the only field that actually
+    # drives marketplace resolution — has nothing to resolve from.
+    import json
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / ".xcore-registry.json").write_text(
+        json.dumps(
+            {"demo": {"source": "marketplace", "repository": "https://github.com/acme/demo"}}
+        )
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    plugin = result.manifest.plugins[0]
+    assert plugin.source is None
+    assert plugin.sha256 is not None  # embedded, hashed normally
+
+
+def test_registry_entry_missing_ref_falls_back_to_embedding(tmp_path):
+    # A 'git' entry with no `ref` — its only origin needs one — has nothing
+    # to resolve from either.
+    import json
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / ".xcore-registry.json").write_text(
+        json.dumps({"demo": {"source": "git", "repository": "https://github.com/acme/demo"}})
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    plugin = result.manifest.plugins[0]
+    assert plugin.source is None
+    assert plugin.sha256 is not None  # embedded, hashed normally
+
+
+def test_registry_entry_from_local_zip_install_is_ignored(tmp_path):
+    # source: "zip" (a one-off local zip install, no stable origin to
+    # re-resolve from) must not be trusted the way marketplace/git are.
+    import json
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / ".xcore-registry.json").write_text(
+        json.dumps(
+            {
+                "demo": {
+                    "source": "zip",
+                    "repository": "https://example.com/demo.zip",
+                    "ref": "e" * 40,
+                }
+            }
+        )
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    assert result.manifest.plugins[0].source is None
+
+
 def test_build_artifact_without_extensions_dir_leaves_manifest_extensions_empty(tmp_path):
     src = tmp_path / "src"
     src.mkdir()
@@ -472,3 +739,363 @@ def test_preexisting_manifest_is_rejected(tmp_path):
             version="1.0.0",
             output_path=tmp_path / "out.xdeploy.enc",
         )
+
+
+# ── _PACKAGING_EXCLUDE_PATTERNS: secrets/bloat must never reach the artifact ──
+
+
+def test_venv_git_and_secret_files_never_reach_the_artifact(tmp_path):
+    # A real private key + populated .env + sqlite DB were once copied into
+    # a sealed artifact via plain `shutil.copytree(source_root, ...)` before
+    # this exclusion existed — this is the regression test for that.
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+
+    (src / ".venv" / "lib" / "site-packages").mkdir(parents=True)
+    (src / ".venv" / "lib" / "site-packages" / "somepkg.py").write_text("# huge, irrelevant\n")
+    (src / ".git" / "objects").mkdir(parents=True)
+    (src / ".git" / "objects" / "pack").write_text("binary git internals\n")
+    (src / "node_modules" / "somedep").mkdir(parents=True)
+    (src / "node_modules" / "somedep" / "index.js").write_text("//\n")
+    (src / "__pycache__").mkdir(parents=True)
+    (src / "__pycache__" / "main.cpython-312.pyc").write_text("bytecode\n")
+    (src / "conf").mkdir(parents=True)
+    (src / "conf" / ".env").write_text("SECRET_KEY=super-secret-value\n")
+    (src / "conf" / ".env.template").write_text("SECRET_KEY=\n")  # must survive
+    (src / "conf" / "private.pem").write_text("-----BEGIN PRIVATE KEY-----\nFAKE\n")
+    (src / "marketplace.db").write_text("sqlite binary content\n")
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    members = _extracted_member_names(result)
+    assert not any(".venv" in name for name in members)
+    assert not any(".git" in name for name in members)
+    assert not any("node_modules" in name for name in members)
+    assert not any("__pycache__" in name for name in members)
+    assert not any(name.endswith("conf/.env") for name in members)
+    assert not any(name.endswith("private.pem") for name in members)
+    assert not any(name.endswith("marketplace.db") for name in members)
+    # the template is a legitimate deployment artifact, not a secret
+    assert any(name.endswith("conf/.env.template") for name in members)
+
+
+def test_content_sha256_ignores_excluded_files(tmp_path):
+    # content_sha256 must describe the tree that's actually sealed
+    # (packaging_root, post-exclusion) — not source_root verbatim, or the
+    # agent's post-extraction re-verification would never match anything
+    # real once a project has a .venv/.env/etc. sitting next to its plugins.
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+
+    result_without_bloat = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out1.xdeploy.enc",
+    )
+    (src / "manifest.json").unlink()
+
+    (src / ".venv").mkdir()
+    (src / ".venv" / "whatever.py").write_text("# irrelevant to content_sha256\n")
+    (src / "secret.pem").write_text("-----BEGIN PRIVATE KEY-----\nFAKE\n")
+
+    result_with_bloat = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out2.xdeploy.enc",
+    )
+
+    assert result_without_bloat.manifest.content_sha256 == result_with_bloat.manifest.content_sha256
+
+
+# ── source: declared in install.yaml — plugin.yaml/extension.yaml untouched ──
+
+
+def test_source_declared_in_install_yaml_marketplace(tmp_path):
+    # plugin.yaml has no source: of its own — the operator centralizes
+    # every plugin's origin in install.yaml instead, see
+    # InstallPluginStep.source's docstring.
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "deployment" / "install.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "format_version": "1",
+                "project_id": PROJECT_ID,
+                "version": "1.0.0",
+                "steps": [
+                    {"id": "prepare", "action": "prepare"},
+                    {
+                        "id": "install_demo",
+                        "action": "install_plugin",
+                        "plugin": "demo",
+                        "source": {"marketplace_slug": "demo", "marketplace_version": "2.0.0"},
+                    },
+                ],
+            }
+        )
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    plugin = result.manifest.plugins[0]
+    assert plugin.source is not None
+    assert plugin.source.marketplace_slug == "demo"
+    assert plugin.source.marketplace_version == "2.0.0"
+    assert plugin.sha256 is None  # source-based, nothing embedded to hash
+    # plugin.yaml itself never had to declare a source: at all
+    assert "source" not in yaml.safe_load((src / "plugins" / "demo" / "plugin.yaml").read_text())
+
+
+def test_source_declared_in_install_yaml_git_fallback(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "deployment" / "install.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "format_version": "1",
+                "project_id": PROJECT_ID,
+                "version": "1.0.0",
+                "steps": [
+                    {"id": "prepare", "action": "prepare"},
+                    {
+                        "id": "install_demo",
+                        "action": "install_plugin",
+                        "plugin": "demo",
+                        "source": {
+                            "url": "https://github.com/acme/demo.git",
+                            "ref": "a" * 40,
+                        },
+                    },
+                ],
+            }
+        )
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    plugin = result.manifest.plugins[0]
+    assert plugin.source is not None
+    assert plugin.source.url == "https://github.com/acme/demo.git"
+    assert plugin.source.ref == "a" * 40
+
+
+def test_install_yaml_source_wins_over_plugin_yaml_source(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / "demo" / "plugin.yaml").write_text(
+        "name: demo\nversion: 1.0.0\nsource:\n  url: https://github.com/from-plugin-yaml/demo.git\n"
+        f"  ref: {'b' * 40}\n"
+    )
+    (src / "deployment" / "install.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "format_version": "1",
+                "project_id": PROJECT_ID,
+                "version": "1.0.0",
+                "steps": [
+                    {"id": "prepare", "action": "prepare"},
+                    {
+                        "id": "install_demo",
+                        "action": "install_plugin",
+                        "plugin": "demo",
+                        "source": {"marketplace_slug": "demo"},
+                    },
+                ],
+            }
+        )
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    plugin = result.manifest.plugins[0]
+    assert plugin.source.marketplace_slug == "demo"  # install.yaml wins
+    assert plugin.source.url is None
+
+
+def test_install_yaml_source_for_extension(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "extensions" / "mail").mkdir(parents=True)
+    # extension.yaml is entirely absent — install.yaml is the only place
+    # this extension's origin is declared.
+    (src / "deployment" / "install.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "format_version": "1",
+                "project_id": PROJECT_ID,
+                "version": "1.0.0",
+                "steps": [
+                    {"id": "prepare", "action": "prepare"},
+                    {"id": "install_demo", "action": "install_plugin", "plugin": "demo"},
+                    {
+                        "id": "install_mail",
+                        "action": "install_extension",
+                        "extension": "mail",
+                        "source": {
+                            "marketplace_slug": "mail",
+                            "marketplace_kind": "service",
+                        },
+                    },
+                ],
+            }
+        )
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    ext = result.manifest.extensions[0]
+    assert ext.source is not None
+    assert ext.source.marketplace_slug == "mail"
+    assert ext.source.marketplace_kind == "service"
+    assert ext.sha256 is None
+    assert not (src / "extensions" / "mail" / "extension.yaml").exists()
+
+
+# ── Pruning a source-based plugin/extension: .env.template must survive it ──
+
+
+def test_source_based_plugin_env_template_survives_pruning(tmp_path):
+    # A source-based plugin's local .env.template (build-time-only, no
+    # counterpart in the resolved repo — see agent.pipeline._resolve_
+    # plugins) must still ship, even though the plugin's real code doesn't:
+    # write_env reads it at deploy time before the plugin is even resolved.
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / "demo" / "plugin.yaml").write_text(
+        "name: demo\nversion: 1.0.0\nsource:\n  url: https://github.com/acme/demo.git\n"
+        f"  ref: {'a' * 40}\n"
+    )
+    (src / "plugins" / "demo" / ".env.template").write_text("DEMO_API_KEY=\n")
+    (src / "plugins" / "demo" / "main.py").write_text("# leftover local code, should be pruned\n")
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    members = _extracted_member_names(result)
+    demo_members = {m for m in members if m.startswith("./plugins/demo/")}
+    assert demo_members == {"./plugins/demo/plugin.yaml", "./plugins/demo/.env.template"}
+
+
+def test_source_based_extension_env_template_survives_pruning(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "extensions" / "mail").mkdir(parents=True)
+    (src / "extensions" / "mail" / "extension.yaml").write_text(
+        f"source:\n  url: https://github.com/acme/mail.git\n  ref: {'a' * 40}\n"
+    )
+    (src / "extensions" / "mail" / ".env.template").write_text("SMTP_HOST=\n")
+    (src / "extensions" / "mail" / "main.py").write_text("# leftover, should be pruned\n")
+    (src / "deployment" / "install.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "format_version": "1",
+                "project_id": PROJECT_ID,
+                "version": "1.0.0",
+                "steps": [
+                    {"id": "prepare", "action": "prepare"},
+                    {"id": "install_demo", "action": "install_plugin", "plugin": "demo"},
+                    {"id": "install_mail", "action": "install_extension", "extension": "mail"},
+                ],
+            }
+        )
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    members = _extracted_member_names(result)
+    mail_members = {m for m in members if m.startswith("./extensions/mail/")}
+    assert mail_members == {"./extensions/mail/extension.yaml", "./extensions/mail/.env.template"}
+
+
+def test_content_sha256_excludes_pruned_source_based_plugin_leftovers(tmp_path):
+    # The regression this whole section guards against: content_sha256 must
+    # describe the SEALED tree (post-pruning), not source_root as it
+    # happens to look right now — otherwise the agent's post-extraction
+    # re-verification (compute_tree_digest over the actually-extracted
+    # tree, which never had the leftover files to begin with) can never
+    # match, for any project where a source-based plugin/extension still
+    # has its old embedded code sitting next to a newly-added `source:`.
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "plugins" / "demo" / "plugin.yaml").write_text(
+        "name: demo\nversion: 1.0.0\nsource:\n  url: https://github.com/acme/demo.git\n"
+        f"  ref: {'a' * 40}\n"
+    )
+
+    result_thin = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out1.xdeploy.enc",
+    )
+    (src / "manifest.json").unlink()
+
+    # Add leftover local code that will be pruned away — content_sha256
+    # must come out identical, since it's never actually sealed.
+    (src / "plugins" / "demo" / "main.py").write_text("# leftover local code\n")
+    (src / "plugins" / "demo" / "helpers.py").write_text("# more leftover code\n")
+
+    result_with_leftovers = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out2.xdeploy.enc",
+    )
+
+    assert result_thin.manifest.content_sha256 == result_with_leftovers.manifest.content_sha256

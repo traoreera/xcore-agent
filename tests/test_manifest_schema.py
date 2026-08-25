@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from xcore_agent.schema.manifest import ProjectManifest
+from xcore_agent.schema.manifest import PluginSource, ProjectManifest
 
 VALID_MANIFEST = {
     "format_version": "1",
@@ -137,3 +137,33 @@ def test_extension_with_source_and_pinned_sha256_is_allowed():
     }
     manifest = ProjectManifest.model_validate(with_ext)
     assert manifest.extension("xmailler").sha256 == "e" * 64
+
+
+# ── PluginSource: marketplace (primary) vs. git (fallback) — see its docstring ──
+
+
+def test_source_accepts_marketplace_slug_alone():
+    source = PluginSource(marketplace_slug="demo")
+    assert source.marketplace_version == "latest"  # default
+    assert source.marketplace_kind == "plugin"  # default
+    assert source.url is None
+
+
+def test_source_accepts_git_url_and_ref():
+    source = PluginSource(url="https://github.com/acme/demo.git", ref="a" * 40)
+    assert source.marketplace_slug is None
+
+
+def test_source_rejects_neither_origin():
+    with pytest.raises(ValidationError, match="exactly one origin"):
+        PluginSource()
+
+
+def test_source_rejects_both_origins_at_once():
+    with pytest.raises(ValidationError, match="exactly one origin"):
+        PluginSource(marketplace_slug="demo", url="https://github.com/acme/demo.git", ref="a" * 40)
+
+
+def test_source_rejects_git_url_without_ref():
+    with pytest.raises(ValidationError, match="requires 'ref'"):
+        PluginSource(url="https://github.com/acme/demo.git")

@@ -1,7 +1,8 @@
-"""Tests for HttpHubClient against its proposed REST contract (see
-hub_client.py's module docstring), using httpx.MockTransport so no real
-network access is needed — there is no real XCore Hub to hit yet, but this
-proves the client actually speaks the contract it claims to.
+"""Tests for HttpHubClient against the real xcore-team/xdeploy contract (see
+hub_client.py's module docstring — validated end to end against a live
+Hub), using httpx.MockTransport so no real network access is needed here.
+Every path asserted below is prefixed with `/app/xdeploy`, the mount xcore
+gives every plugin (see `_MOUNT` in hub_client.py).
 """
 
 import base64
@@ -20,7 +21,7 @@ def _json_response(status_code: int, payload: dict) -> httpx.Response:
 
 async def test_authenticate_success():
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/v1/auth"
+        assert request.url.path == "/app/xdeploy/v1/auth"
         assert json.loads(request.content) == {"xdevkey": "xdev_x", "project_id": "prj_x"}
         return _json_response(200, {"access_token": "tok_123"})
 
@@ -46,7 +47,7 @@ async def test_authenticate_rejected_raises_authentication_error():
 async def test_get_latest_version_sends_bearer_token():
     def handler(request):
         assert request.headers["authorization"] == "Bearer tok_123"
-        assert request.url.path == "/v1/projects/prj_x/versions/latest"
+        assert request.url.path == "/app/xdeploy/v1/projects/prj_x/versions/latest"
         return _json_response(200, {"version": "1.2.3"})
 
     async with HttpHubClient(
@@ -62,7 +63,7 @@ async def test_request_artifact_decodes_base64_fields():
     signature, public_key = b"sig-bytes", b"pub-key-bytes"
 
     def handler(request):
-        assert request.url.path == "/v1/projects/prj_x/artifacts/1.0.0"
+        assert request.url.path == "/app/xdeploy/v1/projects/prj_x/artifacts/1.0.0"
         return _json_response(
             200,
             {
@@ -93,6 +94,31 @@ async def test_download_returns_raw_bytes_from_arbitrary_url():
     ) as client:
         location = ArtifactLocation(
             download_url="https://blob.example/artifact.enc",
+            signature=b"x",
+            signer_public_key=b"y",
+        )
+        data = await client.download(location)
+
+    assert data == b"raw-artifact-bytes"
+
+
+async def test_download_follows_redirect_instead_of_returning_its_body():
+    # Real prod: download_url came back as http:// while the Hub is
+    # HTTPS-only — the reverse proxy 301s to https://. Without follow_
+    # redirects=True, download() silently returned the redirect's ~17-byte
+    # "Moved Permanently" body as if it were the artifact, which then failed
+    # signature verification with no hint that a redirect was the real cause.
+    def handler(request):
+        if str(request.url) == "http://blob.example/artifact.enc":
+            return httpx.Response(301, headers={"Location": "https://blob.example/artifact.enc"})
+        assert str(request.url) == "https://blob.example/artifact.enc"
+        return httpx.Response(200, content=b"raw-artifact-bytes")
+
+    async with HttpHubClient(
+        "https://hub.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        location = ArtifactLocation(
+            download_url="http://blob.example/artifact.enc",
             signature=b"x",
             signer_public_key=b"y",
         )
@@ -156,6 +182,64 @@ async def test_notify_posts_report_fields():
             plugins=[{"id": "demo"}],
         )
         await client.notify(session, report)  # must not raise
+
+
+async def test_publish_posts_multipart_and_decodes_result():
+    dek, signature, public_key = b"d" * 32, b"sig-bytes", b"pub-key-bytes"
+
+    def handler(request):
+        assert request.url.path == "/app/xdeploy/v1/projects/prj_x/publish"
+        assert request.headers["x-api-key"] == "xdev_x"
+        return _json_response(
+            201,
+            {
+                "artifact_id": "art_123",
+                "project_id": "prj_x",
+                "version": "1.0.0",
+                "content_sha256": "a" * 64,
+                "size_bytes": 42,
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        )
+
+    async with HttpHubClient(
+        "https://hub.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await client.publish(
+            xdevkey="xdev_x",
+            project_id="prj_x",
+            project_name="demo",
+            version="1.0.0",
+            ciphertext=b"ciphertext-bytes",
+            content_sha256="a" * 64,
+            dek=dek,
+            signature=signature,
+            signer_public_key=public_key,
+        )
+
+    assert result.artifact_id == "art_123"
+    assert result.size_bytes == 42
+
+
+async def test_publish_denied_raises_authentication_error():
+    def handler(request):
+        return _json_response(403, {"error": "key not bound to this project"})
+
+    async with HttpHubClient(
+        "https://hub.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        with pytest.raises(AuthenticationError, match="not bound"):
+            await client.publish(
+                xdevkey="xdev_x",
+                project_id="prj_x",
+                project_name="demo",
+                version="1.0.0",
+                ciphertext=b"x",
+                content_sha256="a" * 64,
+                dek=b"d" * 32,
+                signature=b"sig",
+                signer_public_key=b"pub",
+            )
 
 
 async def test_server_error_raises_artifact_error_with_status_code():

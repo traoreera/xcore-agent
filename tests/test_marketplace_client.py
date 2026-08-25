@@ -82,6 +82,34 @@ async def test_fetch_artifact_sends_api_key_and_parses_headers():
     assert artifact.repo_header == "acme/my-plugin@1.2.3"
 
 
+async def test_fetch_artifact_follows_redirect_instead_of_returning_its_body():
+    # Same real-prod failure mode as HttpHubClient.download: an unfollowed
+    # 301 (e.g. a reverse proxy enforcing HTTPS) would silently return its
+    # ~17-byte "Moved Permanently" body as if it were the plugin's ZIP,
+    # which then fails HMAC verification with no hint a redirect happened.
+    zip_bytes = b"PK\x03\x04fake-zip-bytes"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/app/marketplace/plugins/my-plugin/install":
+            return httpx.Response(
+                301,
+                headers={
+                    "Location": "https://hub.example/app/marketplace/plugins/my-plugin/install/"
+                },
+            )
+        assert request.url.path == "/app/marketplace/plugins/my-plugin/install/"
+        return httpx.Response(
+            200, content=zip_bytes, headers={"X-Signature": "hmac_sha256:deadbeef"}
+        )
+
+    async with MarketplaceClient(
+        "https://hub.example", api_key="xdk_test", transport=httpx.MockTransport(handler)
+    ) as client:
+        artifact = await client.fetch_artifact(slug="my-plugin", version="1.2.3")
+
+    assert artifact.data == zip_bytes
+
+
 async def test_fetch_artifact_uses_x_service_header_for_service_kind():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/app/xservices/services/my-ext/install"
