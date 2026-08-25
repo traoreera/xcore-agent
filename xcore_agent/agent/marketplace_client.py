@@ -122,10 +122,22 @@ class MarketplaceClient:
         await self._client.aclose()
 
     async def get_latest_version(self, *, slug: str, kind: Kind = "plugin") -> str:
-        """Poll target for `agent.watcher.Watcher` — reads the public
-        `GET /{kind}/{slug}` detail route, which reports `latest_version`."""
+        """Poll target for `agent.watcher.Watcher`/`watch_sources` — reads
+        the `GET /{kind}/{slug}` detail route, which reports
+        `latest_version`. Public for a `visibility="public"` target, but
+        sends X-API-Key anyway (real prod bug found running watch-sources
+        against a project with several private sources: this route only
+        recognized a JWT session, never an xdevkey, so a private plugin
+        404'd for every xcore-agent caller regardless of whether its key
+        actually had access — see xcore-team/marketplace's `_api_key_
+        viewer_id`/xcore-team/xservices's route fix for the server side of
+        this same commit)."""
         mount = _mount(_KIND_HUB_PLUGIN[kind])
-        response = await _get_with_retry(self._client, f"{mount}/{_kind_path(kind)}/{slug}")
+        response = await _get_with_retry(
+            self._client,
+            f"{mount}/{_kind_path(kind)}/{slug}",
+            headers={"X-API-Key": self._api_key},
+        )
         _raise_for_status(response, "get_latest_version")
         latest = response.json().get("latest_version")
         if not latest:
