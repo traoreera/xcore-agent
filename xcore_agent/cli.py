@@ -20,13 +20,14 @@ from .agent.kubernetes_supervisor import KubernetesSupervisor
 from .agent.marketplace_client import MarketplaceClient
 from .agent.marketplace_pipeline import MarketplaceDeploymentReport, MarketplaceDeploymentRunner
 from .agent.marketplace_watcher import MarketplaceWatcher, MarketplaceWatchResult
-from .agent.pipeline import DeploymentCredentials, DeploymentRunner
 from .agent.notifiers import load_notifiers_from_config
+from .agent.pipeline import DeploymentCredentials, DeploymentRunner
 from .agent.provisioners import load_provisioners_from_config
 from .agent.systemd_supervisor import SystemdSupervisor
 from .agent.watcher import Watcher, WatchResult
 from .packer.builder import build_artifact
 from .plugin_resolver import PluginResolver
+from .resolve_sources import ResolvedSource, resolve_all_sources
 from .scaffold import (
     ExtensionSpec,
     PluginSpec,
@@ -900,6 +901,85 @@ def gc(
     )
     if report.plugins_restarted:
         console.print(f"[green]Restarted[/green]: {', '.join(report.plugins_restarted)}")
+
+
+@app.command("resolve-sources")
+def resolve_sources_cmd(
+    project_root: Path = typer.Argument(
+        ..., help="Project root containing deployment/install.yaml and its plugins/extensions"
+    ),
+    install_plan: Path = typer.Option(
+        None,
+        help="Override path to install.yaml (default: <project_root>/deployment/install.yaml)",
+    ),
+    marketplace_url: str = typer.Option(
+        "https://marketplace.xcorehub.dev",
+        envvar="XCORE_MARKETPLACE_URL",
+        help="Marketplace root, used for any step whose source: is a marketplace slug.",
+    ),
+    marketplace_api_key: str = typer.Option(
+        None,
+        envvar="XCORE_MARKETPLACE_API_KEY",
+        help="xdevkeys API key (xdk_...), required only if some step has a marketplace-slug "
+        "source:.",
+    ),
+    marketplace_signing_secret: str = typer.Option(
+        None,
+        envvar="XCORE_MARKETPLACE_SIGNING_SECRET",
+        help="HMAC signing secret verifying marketplace-sourced steps — required alongside "
+        "--marketplace-api-key whenever this project has one.",
+    ),
+    git_token: list[str] = typer.Option(
+        [],
+        help="HOST=TOKEN for a private git host a source-based step may need to authenticate "
+        "against (repeatable). Public repos and SSH URLs need none of this.",
+    ),
+    cache_root: Path = typer.Option(
+        None,
+        help="Resolver cache directory (default: ~/.cache/xcore-agent/resolve-sources).",
+    ),
+) -> None:
+    """Resolve every `source:` declared in a project's own install.yaml
+    directly onto its plugins/extensions directories, in place — no
+    `.xdeploy` artifact, no Hub, no signature/hash pin involved. For a
+    project resolving its OWN declared sources against itself: typically a
+    container image reconstructing its marketplace-sourced plugins at boot
+    (docker-entrypoint.sh), before the app underneath ever loads them —
+    see agent.pipeline.DeploymentRunner._resolve_plugins for the
+    artifact-verifying equivalent of this used by `deploy`/`watch`.
+    """
+
+    async def _run() -> list[ResolvedSource]:
+        async with contextlib.AsyncExitStack() as stack:
+            marketplace_client = None
+            if marketplace_api_key:
+                marketplace_client = await stack.enter_async_context(
+                    MarketplaceClient(marketplace_url, api_key=marketplace_api_key)
+                )
+            resolver = PluginResolver(
+                cache_root=cache_root or Path.home() / ".cache" / "xcore-agent" / "resolve-sources",
+                git_credentials=_parse_git_tokens(git_token),
+                marketplace_client=marketplace_client,
+                trusted_signer_secret=(
+                    marketplace_signing_secret.encode() if marketplace_signing_secret else None
+                ),
+            )
+            return await resolve_all_sources(
+                project_root, plugin_resolver=resolver, install_plan_path=install_plan
+            )
+
+    try:
+        resolved = asyncio.run(_run())
+    except Exception as exc:
+        console.print(f"[red]resolve-sources failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if not resolved:
+        console.print("[dim]Nothing to resolve — no step declares a source:.[/dim]")
+        return
+    console.print(f"[green]Resolved {len(resolved)} source(s)[/green]:")
+    for r in resolved:
+        console.print(f"  - {r.kind} {r.id!r} -> {r.target}")
 
 
 if __name__ == "__main__":

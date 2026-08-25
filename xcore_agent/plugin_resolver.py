@@ -35,16 +35,30 @@ same `git` operation with different authentication, exactly like using
   clone failure otherwise).
 """
 
+from __future__ import annotations
+
 import shutil
 import subprocess
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit, urlunsplit
 
 from . import crypto
-from .agent.marketplace_client import MarketplaceClient
 from .schema.manifest import PluginSource
+
+if TYPE_CHECKING:
+    # Deferred: importing agent.marketplace_client at module level here
+    # would trigger xcore_agent.agent's own __init__.py (Python always
+    # initializes a package before one of its submodules), which imports
+    # .pipeline, which imports THIS module back — a real circular import
+    # that only ever avoided firing because xcore_agent.cli always
+    # happened to import xcore_agent.agent first. Nothing at runtime here
+    # actually needs the class value: `marketplace_client` below is only
+    # ever constructed by a caller (cli.py) and handed in; this module
+    # only calls methods on it, never `MarketplaceClient(...)` itself.
+    from .agent.marketplace_client import MarketplaceClient
 
 
 class PluginResolutionError(Exception):

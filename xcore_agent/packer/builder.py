@@ -268,9 +268,9 @@ def write_manifest(
             # a source resolved (install.yaml, extension.yaml's own
             # `source:`, or the registry — same priority as plugins above)
             # means "resolved at deploy time, nothing to hash here".
-            ext_source = extension_sources.get(
-                extension_dir.name
-            ) or _read_extension_source(extension_dir / EXTENSION_MANIFEST_FILENAME)
+            ext_source = extension_sources.get(extension_dir.name) or _read_extension_source(
+                extension_dir / EXTENSION_MANIFEST_FILENAME
+            )
             if ext_source is not None:
                 pruned_relpaths.update(
                     _non_manifest_relpaths(
@@ -325,7 +325,11 @@ def seal_directory(
     plaintext_tar = _tar_bytes(source_root)
     compressed = zstandard.ZstdCompressor(level=19).compress(plaintext_tar)
 
-    dek = AESGCM.generate_key(bit_length=256)
+    # cryptography's own Rust-backed AESGCM.generate_key accepts bit_length
+    # at runtime (verified — every build in this test suite calls this),
+    # but its bundled type stub doesn't declare the kwarg, so mypy flags it
+    # regardless of the installed cryptography version.
+    dek = AESGCM.generate_key(bit_length=256)  # type: ignore[call-arg]
     nonce = secrets.token_bytes(12)
     ciphertext = nonce + AESGCM(dek).encrypt(nonce, compressed, None)
 

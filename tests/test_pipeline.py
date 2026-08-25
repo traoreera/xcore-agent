@@ -315,9 +315,7 @@ async def test_install_failure_triggers_rollback(tmp_path):
             }
         ],
     )
-    write_manifest(
-        src, project_id=PROJECT_ID, project_name="demo-project", version="1.0.0"
-    )
+    write_manifest(src, project_id=PROJECT_ID, project_name="demo-project", version="1.0.0")
     ciphertext, dek, signature, public_key = seal_directory(src)
     sealed = {"encrypted": ciphertext, "dek": dek, "signature": signature, "public_key": public_key}
     runner, _hub = _make_runner(tmp_path, sealed)

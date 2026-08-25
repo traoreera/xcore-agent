@@ -57,7 +57,7 @@ plugins:
             inherited_members: true
             heading_level: 3
           import:
-            - https://raw.githubusercontent.com/pydantic/pydantic/main/pydantic/json_schema.py
+            - https://docs.pydantic.dev/latest/objects.inv
 
 markdown_extensions:
   - admonition

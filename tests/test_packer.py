@@ -233,8 +233,7 @@ def test_plugin_declaring_env_inject_without_template_is_rejected(tmp_path):
     src.mkdir()
     _minimal_source_tree(src)
     (src / "plugins" / "demo" / "plugin.yaml").write_text(
-        "name: demo\nversion: 1.0.0\n"
-        "envconfiguration:\n  inject: true\n  env_file: .env\n"
+        "name: demo\nversion: 1.0.0\n" "envconfiguration:\n  inject: true\n  env_file: .env\n"
     )
 
     with pytest.raises(BuildError, match=r"\.env\.template"):
@@ -252,8 +251,7 @@ def test_plugin_declaring_env_inject_with_template_present_succeeds(tmp_path):
     src.mkdir()
     _minimal_source_tree(src)
     (src / "plugins" / "demo" / "plugin.yaml").write_text(
-        "name: demo\nversion: 1.0.0\n"
-        "envconfiguration:\n  inject: true\n  env_file: .env\n"
+        "name: demo\nversion: 1.0.0\n" "envconfiguration:\n  inject: true\n  env_file: .env\n"
     )
     (src / "plugins" / "demo" / ".env.template").write_text("SOME_SECRET=${SOME_SECRET}\n")
 
@@ -419,7 +417,9 @@ def test_registry_entry_missing_slug_falls_back_to_embedding(tmp_path):
     src.mkdir()
     _minimal_source_tree(src)
     (src / "plugins" / ".xcore-registry.json").write_text(
-        json.dumps({"demo": {"source": "marketplace", "repository": "https://github.com/acme/demo"}})
+        json.dumps(
+            {"demo": {"source": "marketplace", "repository": "https://github.com/acme/demo"}}
+        )
     )
 
     result = build_artifact(

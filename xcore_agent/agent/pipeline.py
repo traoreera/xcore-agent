@@ -41,6 +41,7 @@ from .hub_client import ArtifactLocation, DeploymentReport, HubClient, Session
 from .install_driver import InstallDriver, Layout, Notifier, Provisioner
 from .state import TERMINAL_STATES, TRANSITIONS, DeploymentState
 
+
 def _describe_source(source: PluginSource) -> str:
     """Human-readable origin for an error message — marketplace slug@version
     or git url@ref, whichever `source` actually carries (see `PluginSource`'s

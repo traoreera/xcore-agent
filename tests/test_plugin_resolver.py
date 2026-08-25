@@ -207,9 +207,7 @@ async def test_resolve_marketplace_respects_subdirectory(tmp_path):
     zip_bytes = _zipball()
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200, content=zip_bytes, headers={"X-Signature": _sign(zip_bytes)}
-        )
+        return httpx.Response(200, content=zip_bytes, headers={"X-Signature": _sign(zip_bytes)})
 
     async with MarketplaceClient(
         "https://hub.example", api_key="xdk_test", transport=httpx.MockTransport(handler)
@@ -234,9 +232,7 @@ async def test_resolve_marketplace_is_cached_on_second_call(tmp_path):
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal call_count
         call_count += 1
-        return httpx.Response(
-            200, content=zip_bytes, headers={"X-Signature": _sign(zip_bytes)}
-        )
+        return httpx.Response(200, content=zip_bytes, headers={"X-Signature": _sign(zip_bytes)})
 
     async with MarketplaceClient(
         "https://hub.example", api_key="xdk_test", transport=httpx.MockTransport(handler)

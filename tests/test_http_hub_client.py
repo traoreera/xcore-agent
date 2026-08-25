@@ -110,9 +110,7 @@ async def test_download_follows_redirect_instead_of_returning_its_body():
     # signature verification with no hint that a redirect was the real cause.
     def handler(request):
         if str(request.url) == "http://blob.example/artifact.enc":
-            return httpx.Response(
-                301, headers={"Location": "https://blob.example/artifact.enc"}
-            )
+            return httpx.Response(301, headers={"Location": "https://blob.example/artifact.enc"})
         assert str(request.url) == "https://blob.example/artifact.enc"
         return httpx.Response(200, content=b"raw-artifact-bytes")
 
