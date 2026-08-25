@@ -80,13 +80,20 @@ async def check_once(
     """Check every marketplace source in `install.yaml` once; resolve and
     apply any whose published version differs from what's recorded (in
     `<project_root>/.xcore/watch-sources-state.json`) as currently applied.
-    Seeded from nothing on first run — that first tick applies whatever the
-    marketplace currently reports as latest for every source, which may
-    already differ from install.yaml's own build-time pin (that field is a
-    record of what the image was built with, not touched here). Returns
-    what was actually updated — an empty list is a normal, common outcome,
-    not an error. A single source's failure (marketplace unreachable, bad
-    signature) is logged and skipped, never aborts the others' checks."""
+    On first check for a given source (nothing recorded yet on this host),
+    seeded from install.yaml's own build-time pin rather than blindly
+    treating it as "unset, therefore an update": resolve-sources already
+    fetched exactly that pinned version into this directory at build time,
+    so a fresh deploy whose pin already matches the marketplace's current
+    latest correctly reports no change instead of "updating" to the exact
+    version that's already there (which, combined with `watch_forever`'s
+    `exit_on_update`, would otherwise self-restart the process once on
+    every single fresh boot for no reason). Only a source pinned to
+    "latest" (no fixed version to seed from) is left as a genuine
+    first-tick update when unrecorded. Returns what was actually updated —
+    an empty list is a normal, common outcome, not an error. A single
+    source's failure (marketplace unreachable, bad signature) is logged
+    and skipped, never aborts the others' checks."""
     plan_path = install_plan_path or project_root / _INSTALL_PLAN_PATH
     if not plan_path.is_file():
         raise WatchSourcesError(f"{plan_path} not found")
@@ -103,6 +110,7 @@ async def check_once(
     state = _read_state(state_path)
     plugins_dirname = _read_plugins_dirname(project_root)
     updates: list[SourceUpdate] = []
+    state_dirty = False
 
     for step in plan.steps:
         if isinstance(step, InstallPluginStep) and step.source is not None:
@@ -128,7 +136,22 @@ async def check_once(
             continue
 
         current = state.get(step.id)
+        if current is None:
+            # Never checked before on this host — seed from install.yaml's
+            # OWN pin rather than treating this as "unset, therefore an
+            # update": resolve-sources (build time) already fetched
+            # exactly source.marketplace_version into this directory, so a
+            # fresh deploy whose pin already matches the marketplace's
+            # current latest has nothing to do. Without this, EVERY first
+            # boot re-"discovers" all sources as new and (with
+            # exit_on_update) immediately self-restarts once for no
+            # reason — real "latest" isn't a valid pin to seed from, so
+            # that case is left as a genuine first-tick update.
+            current = source.marketplace_version if source.marketplace_version != "latest" else None
         if current == latest:
+            if state.get(step.id) != latest:
+                state[step.id] = latest
+                state_dirty = True
             continue
 
         try:
@@ -153,8 +176,9 @@ async def check_once(
             SourceUpdate(id=step.id, kind=kind, slug=slug, from_version=current, to_version=latest)
         )
         state[step.id] = latest
+        state_dirty = True
 
-    if updates:
+    if state_dirty:
         _write_state(state_path, state)
     return updates
 

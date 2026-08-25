@@ -141,7 +141,9 @@ async def test_second_check_skips_unchanged_versions(tmp_path):
                 "id": "install_auth",
                 "action": "install_plugin",
                 "plugin": "auth",
-                "source": {"marketplace_slug": "xauth", "marketplace_version": "1.0.0"},
+                # Pinned older than latest — a genuine update on first check,
+                # unlike test_first_check_seeds_from_installyaml_pin below.
+                "source": {"marketplace_slug": "xauth", "marketplace_version": "0.9.0"},
             }
         ],
     )
@@ -155,6 +157,68 @@ async def test_second_check_skips_unchanged_versions(tmp_path):
     assert second == []
     # No re-fetch — state already recorded 1.0.0 as applied.
     assert client.fetch_calls == [("xauth", "1.0.0", "plugin")]
+
+
+async def test_first_check_seeds_from_installyaml_pin_not_blindly_from_unset(tmp_path):
+    # Real bug found via a live boot test: a fresh deploy has NOTHING in
+    # .xcore/watch-sources-state.json yet, but resolve-sources already
+    # fetched install.yaml's own pinned version at build time. Comparing
+    # against bare `None` instead of that pin meant EVERY first check
+    # "discovered" every source as a fresh update — which, combined with
+    # watch_forever's exit_on_update, self-restarted the whole container
+    # once on every single fresh boot for no reason (nothing had actually
+    # changed).
+    client = FakeMarketplaceClient()
+    client.latest_versions = {"xauth": "1.0.0"}
+    root = tmp_path / "project"
+    root.mkdir()
+    plan_path = _write_install_plan(
+        root,
+        steps=[
+            {
+                "id": "install_auth",
+                "action": "install_plugin",
+                "plugin": "auth",
+                # Already pinned to exactly what's latest — nothing to do.
+                "source": {"marketplace_slug": "xauth", "marketplace_version": "1.0.0"},
+            }
+        ],
+    )
+    resolver = _resolver(client, tmp_path)
+
+    updates = await check_once(root, plugin_resolver=resolver, install_plan_path=plan_path)
+
+    assert updates == []
+    assert client.fetch_calls == []  # never re-resolved something already correct
+    state = yaml.safe_load((root / ".xcore" / "watch-sources-state.json").read_text())
+    assert state == {"install_auth": "1.0.0"}  # still recorded, for future ticks' benefit
+
+
+async def test_first_check_still_updates_when_pinned_to_latest_sentinel(tmp_path):
+    # marketplace_version: "latest" has no fixed pin to seed from — the
+    # first check must still treat it as a genuine update, unlike a real
+    # version pin.
+    client = FakeMarketplaceClient()
+    client.latest_versions = {"xauth": "1.0.0"}
+    root = tmp_path / "project"
+    root.mkdir()
+    plan_path = _write_install_plan(
+        root,
+        steps=[
+            {
+                "id": "install_auth",
+                "action": "install_plugin",
+                "plugin": "auth",
+                "source": {"marketplace_slug": "xauth", "marketplace_version": "latest"},
+            }
+        ],
+    )
+    resolver = _resolver(client, tmp_path)
+
+    updates = await check_once(root, plugin_resolver=resolver, install_plan_path=plan_path)
+
+    assert len(updates) == 1
+    assert updates[0].to_version == "1.0.0"
 
 
 async def test_one_sources_failure_does_not_block_the_others(tmp_path):
