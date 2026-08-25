@@ -38,6 +38,22 @@ cached downloads don't grow forever. `MarketplaceWatcher`
 polling one plugin/extension slug via `MarketplaceClient.get_latest_version`
 and redeploying through `MarketplaceDeploymentRunner`.
 
+A third mechanism sits outside both pipelines — no artifact, no state
+machine, no Hub of either kind: `resolve-sources`/`watch-sources`
+(`resolve_sources.py`/`watch_sources.py`) resolve every `source:` a
+project's *own* `install.yaml` declares (marketplace slug or git) directly
+onto its `plugins/`/`extensions/` directories, in place. For a project
+resolving its **own** sources against itself — typically a container image
+reconstructing its marketplace-sourced plugins at boot
+(`docker-entrypoint.sh`), before the app underneath ever loads them —
+rather than for installing a Hub-hosted bundle onto a *different* host, which
+is what `deploy`/`deploy-marketplace` are for. `watch-marketplace` cannot
+substitute for `watch-sources` here: it replays the entire `install.yaml`
+through one fetched artifact, which only works when the project being
+deployed **is** a single marketplace plugin/extension, not when it merely
+**depends on** several independent ones (see `watch_sources.py`'s module
+docstring).
+
 ## What's real vs. stubbed today
 
 | Component | Status |
@@ -60,6 +76,8 @@ and redeploying through `MarketplaceDeploymentRunner`.
 | k8s supervisor | Implemented, tested — `agent/kubernetes_supervisor.py` |
 | CI/CD watch loop for the marketplace flow | Implemented, tested — `agent/marketplace_watcher.py` |
 | `install.yaml` scaffolding | Implemented, tested — `scaffold.py`, exposed as `init-plan` |
+| In-place marketplace source resolution (`resolve-sources`/`watch-sources`) | Implemented, tested — `resolve_sources.py`, `watch_sources.py` |
+| `.xdeploy` upload to a live Hub (`publish`) | Implemented, tested — `agent/hub_client.py::HttpHubClient.publish`; the *download* side (`deploy`/`watch`) still targets the proposed, not-yet-live Hub contract above |
 
 `install.yaml` has **no generic "run a command" action** — every step is one
 of a fixed, closed set (`prepare`, `provision`, `install_plugin`,
