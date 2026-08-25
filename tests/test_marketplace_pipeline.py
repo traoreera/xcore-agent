@@ -186,6 +186,61 @@ async def test_full_pipeline_succeeds_for_service_kind(tmp_path):
     assert not (runner.project_root / "plugins" / SLUG).exists()
 
 
+async def test_respects_target_projects_own_plugins_directory_convention(tmp_path):
+    # Real bug: this flow never has a manifest.json (see _load_plan's own
+    # comment) to read plugins_dirname back from, so Layout silently fell
+    # back to its "plugins" default even when the TARGET project's own
+    # integration.yaml declares a different convention (e.g. xcore-team/
+    # marketplace itself, which loads plugins from "app/") — installing
+    # into a directory the running app never actually reads from, with no
+    # error to notice it by.
+    zip_bytes = _build_zipball()
+    client = FakeMarketplaceClient(
+        zip_bytes=zip_bytes, signature_hex=_sign(zip_bytes), plugin_header="demo-plugin@1.0.0"
+    )
+    project_root = tmp_path / "deployed"
+    project_root.mkdir(parents=True)
+    (project_root / "integration.yaml").write_text(
+        yaml.safe_dump({"plugins": {"directory": "./app"}})
+    )
+    # A minimal plan without _write_install_plan's write_env step: that
+    # helper hardcodes its `from:` at "plugins/<slug>/..." regardless of
+    # this test's custom convention, which is orthogonal to what's being
+    # verified here (the install_plugin source lookup, not write_env).
+    plan_path = tmp_path / "install.yaml"
+    plan_path.write_text(
+        yaml.safe_dump(
+            {
+                "format_version": "1",
+                "project_id": SLUG,
+                "version": "1.0.0",
+                "steps": [
+                    {"id": "prepare", "action": "prepare"},
+                    {"id": "install_demo", "action": "install_plugin", "plugin": SLUG},
+                    {"id": "start", "action": "start", "depends_on": ["install_demo"]},
+                ],
+            }
+        )
+    )
+
+    runner = MarketplaceDeploymentRunner(
+        client=client,
+        slug=SLUG,
+        workdir=tmp_path / "work",
+        project_root=project_root,
+        trusted_signer_secret=SECRET,
+        install_plan_path=plan_path,
+        version="1.0.0",
+    )
+
+    report = await runner.run()
+
+    assert report.status == "success"
+    assert (project_root / "app" / SLUG / "plugin.yaml").is_file()
+    # Not installed under the "plugins" default (the bug's symptom).
+    assert not (project_root / "plugins" / SLUG).exists()
+
+
 async def test_report_to_hub_uses_configured_host_id(tmp_path):
     zip_bytes = _build_zipball()
     client = FakeMarketplaceClient(

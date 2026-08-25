@@ -29,6 +29,7 @@ from pathlib import Path
 import yaml
 
 from .. import crypto
+from ..packer.builder import _read_plugins_dirname
 from ..plugin_resolver import PluginResolutionError, flatten_single_root, safe_extract_zip
 from ..schema.install import (
     ConfigurePluginStep,
@@ -101,6 +102,15 @@ class MarketplaceDeploymentRunner:
                 Layout(
                     project_root=self.project_root,
                     extracted_root=self.workdir / "extracted",
+                    # This flow never has a manifest.json (see _load_plan)
+                    # to read plugins_dirname back from, so — unlike
+                    # agent.pipeline.DeploymentRunner — it would otherwise
+                    # silently fall back to Layout's "plugins" default even
+                    # for a target project whose own integration.yaml
+                    # declares a different convention (e.g. "app/", see
+                    # xcore-team/marketplace), installing into a directory
+                    # the running app never reads from.
+                    plugins_dirname=_read_plugins_dirname(self.project_root),
                 ),
                 provisioners=self.provisioners,
                 notifiers=self.notifiers,
@@ -167,12 +177,18 @@ class MarketplaceDeploymentRunner:
     def _extract(self, artifact: FetchedArtifact) -> None:
         self._transition(MarketplaceDeploymentState.EXTRACTING)
         extracted_root = self.workdir / "extracted"
+        assert self.driver is not None
         # kind="service" extracts into extensions/<slug>, matching what
         # InstallDriver.install_extension actually looks for — a
         # kind=service deployment previously always extracted into
         # plugins/<slug> regardless, which install_extension never reads
         # from, silently installing nothing (see _dispatch's matching fix).
-        subdir = "plugins" if self.kind == "plugin" else "extensions"
+        # kind="plugin" must match install_plugin's OWN lookup, which reads
+        # layout.plugins_dirname (now resolved from the target project's
+        # integration.yaml, see __post_init__) rather than a hardcoded
+        # "plugins" — staging anywhere else would leave install_plugin
+        # unable to find what was just extracted.
+        subdir = self.driver.layout.plugins_dirname if self.kind == "plugin" else "extensions"
         target = extracted_root / subdir / self.slug
         if target.exists():
             shutil.rmtree(target)

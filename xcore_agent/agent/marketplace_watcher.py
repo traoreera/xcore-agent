@@ -59,7 +59,10 @@ class MarketplaceWatcher:
         self._supervisor = supervisor
         self._provisioners = provisioners
         self._notifiers = notifiers
-        self._state = StateStore(project_root)
+        # namespace=slug: see StateStore's own docstring — several
+        # MarketplaceWatchers (one per slug) can share a project_root
+        # without clobbering each other's recorded version.
+        self._state = StateStore(project_root, namespace=slug)
 
     async def check_once(self) -> MarketplaceWatchResult:
         latest = await self._client.get_latest_version(slug=self._slug, kind=self._kind)
