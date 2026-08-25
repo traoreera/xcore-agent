@@ -37,6 +37,9 @@ from .scaffold import (
 )
 from .schema.install import InstallPlan
 from .schema.manifest import ProjectManifest
+from .watch_sources import SourceUpdate
+from .watch_sources import check_once as _watch_sources_check_once
+from .watch_sources import watch_forever as _watch_sources_watch_forever
 
 app = typer.Typer(add_completion=False, help="xcore-agent — deploys .xdeploy artifacts.")
 console = Console()
@@ -980,6 +983,95 @@ def resolve_sources_cmd(
     console.print(f"[green]Resolved {len(resolved)} source(s)[/green]:")
     for r in resolved:
         console.print(f"  - {r.kind} {r.id!r} -> {r.target}")
+
+
+@app.command("watch-sources")
+def watch_sources_cmd(
+    project_root: Path = typer.Argument(
+        ..., help="Project root containing deployment/install.yaml and its plugins/extensions"
+    ),
+    marketplace_api_key: str = typer.Option(..., envvar="XCORE_MARKETPLACE_API_KEY"),
+    marketplace_signing_secret: str = typer.Option(..., envvar="XCORE_MARKETPLACE_SIGNING_SECRET"),
+    marketplace_url: str = typer.Option(
+        "https://marketplace.xcorehub.dev",
+        envvar="XCORE_MARKETPLACE_URL",
+        help="Marketplace root, used for every step whose source: is a marketplace slug.",
+    ),
+    install_plan: Path = typer.Option(
+        None,
+        help="Override path to install.yaml (default: <project_root>/deployment/install.yaml)",
+    ),
+    interval: int = typer.Option(300, help="Seconds between marketplace checks"),
+    once: bool = typer.Option(False, help="Check once and exit instead of looping forever"),
+    exit_on_update: bool = typer.Option(
+        False,
+        help="Exit (code 0) right after applying at least one update instead of continuing "
+        "to poll — for a process supervisor that restarts the whole process to pick up the "
+        "newly-written files (this command never restarts anything itself). Ignored with "
+        "--once, which always exits after its single check.",
+    ),
+    cache_root: Path = typer.Option(
+        None,
+        help="Resolver cache directory (default: ~/.cache/xcore-agent/watch-sources).",
+    ),
+) -> None:
+    """Poll the marketplace for every `source:` declared in a project's own
+    install.yaml and re-resolve (in place) whichever ones have a newer
+    published version — the multi-source counterpart to `watch-marketplace`
+    for a project that DEPENDS ON several independent marketplace plugins/
+    extensions rather than BEING one itself (`watch-marketplace` replays
+    install.yaml's entire plan through a single fetched artifact, which
+    breaks the moment more than one step declares its own source: — see
+    watch_sources.py's module docstring). Like `resolve-sources`, this
+    never touches install.yaml's own steps (no start/healthcheck, no
+    InstallDriver) and never restarts anything — see --exit-on-update for
+    the intended way to let a supervisor do that."""
+
+    def _report(updates: list[SourceUpdate]) -> None:
+        for u in updates:
+            console.print(
+                f"[green]Updated[/green] {u.kind} {u.slug} "
+                f"({u.from_version or 'unset'} -> {u.to_version})"
+            )
+
+    def _report_error(exc: Exception) -> None:
+        console.print(f"[red]Check failed:[/red] {exc}")
+
+    async def _watch() -> list[SourceUpdate]:
+        async with MarketplaceClient(marketplace_url, api_key=marketplace_api_key) as client:
+            resolver = PluginResolver(
+                cache_root=cache_root or Path.home() / ".cache" / "xcore-agent" / "watch-sources",
+                marketplace_client=client,
+                trusted_signer_secret=marketplace_signing_secret.encode(),
+            )
+            if once:
+                return await _watch_sources_check_once(
+                    project_root, plugin_resolver=resolver, install_plan_path=install_plan
+                )
+            await _watch_sources_watch_forever(
+                project_root,
+                plugin_resolver=resolver,
+                install_plan_path=install_plan,
+                interval_seconds=interval,
+                exit_on_update=exit_on_update,
+                on_updates=_report,
+                on_error=_report_error,
+            )
+            return []
+
+    if once:
+        try:
+            updates = asyncio.run(_watch())
+        except Exception as exc:
+            _report_error(exc)
+            raise typer.Exit(code=1) from exc
+        if updates:
+            _report(updates)
+        else:
+            console.print("[dim]No change — every source already up to date.[/dim]")
+        return
+
+    asyncio.run(_watch())
 
 
 if __name__ == "__main__":
