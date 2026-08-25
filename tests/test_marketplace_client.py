@@ -26,9 +26,7 @@ def _no_real_sleep(monkeypatch):
     async def _instant_sleep(_seconds: float) -> None:
         return None
 
-    monkeypatch.setattr(
-        "xcore_agent.agent.marketplace_client.asyncio.sleep", _instant_sleep
-    )
+    monkeypatch.setattr("xcore_agent.agent.marketplace_client.asyncio.sleep", _instant_sleep)
 
 
 # ── Retry-with-backoff on transient status codes (404/5xx) — see the real- ──
