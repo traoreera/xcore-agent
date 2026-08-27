@@ -76,6 +76,34 @@ The DEK (hex) and signer public key (hex) are printed to stdout — hand the
 DEK to the Hub for storage and distribute the public key to agents. They are
 never saved by the agent.
 
+## `publish`
+
+Build, encrypt, sign, **and upload** a `.xdeploy` artifact to XCore Hub in
+one step — `build` alone only produces a local file (you'd have to hand the
+DEK to the Hub yourself); this does that upload for you. The DEK never
+touches disk, exactly like `deploy`/`watch` never persist one either.
+
+```
+xcore-agent publish <source-root> --project-id <id> --project-name <name>
+                    --version <ver> --xdevkey <key>
+                    [--hub-url <url>] [--output <path>] [--signing-key-file <path>]
+```
+
+| Argument / option | Environment | Description |
+|---|---|---|
+| `source-root` | | Project source tree: `plugins/`, `integration.yaml`, `deployment/install.yaml` |
+| `--project-id` | `XCORE_PROJECT_ID` | Project id (`prj_...`) |
+| `--project-name` | | Project display name |
+| `--version` | | Version to stamp on this artifact, e.g. `1.0.0` |
+| `--xdevkey` | `XCORE_XDEVKEY` | Project XDevKey — authenticates the upload to the Hub |
+| `--hub-url` | `XCORE_HUB_URL` | Hub base URL (default `https://hub.xcorehub.dev`) |
+| `--output` | | Also write the sealed artifact locally (optional — it stays on the Hub either way; this is just a copy for your own records) |
+| `--signing-key-file` | | Same as `build --signing-key-file` — reuse the same key across every version of a project a `watch`er is told to follow, or it will reject the new signer |
+
+Unlike `deploy`/`watch` below, this only needs the Hub's **upload** path
+(`HttpHubClient.publish`) to work, not its download/authorize path — so it
+is not affected by their "not available yet" caveat.
+
 ## `deploy`
 
 Deploy a project version fetched from XCore Hub (the proposed `.xdeploy`
@@ -100,7 +128,11 @@ xcore-agent deploy --project-id <id> --version <ver>
 | `--project-root` | | Target install directory, e.g. `/etc/xcore/projects/my-erp` |
 | `--signer-public-key` | | Path to the Hub's Ed25519 public key (raw 32 bytes) |
 | `--git-token` | | `HOST=TOKEN` for a private git host a source-based plugin needs (repeatable) |
+| `--marketplace-url` | `XCORE_MARKETPLACE_URL` | Marketplace root (no `/app/...` segment), used to resolve any plugin/extension whose `source:` is a marketplace slug (default `https://marketplace.xcorehub.dev`) — irrelevant if every plugin is embedded or git-sourced |
+| `--marketplace-api-key` | `XCORE_MARKETPLACE_API_KEY` | `xdevkeys` API key (`xdk_...`), required only if some plugin/extension has a marketplace-slug `source:` (the default `xcli plugin install` records) |
+| `--marketplace-signing-secret` | `XCORE_MARKETPLACE_SIGNING_SECRET` | HMAC signing secret verifying marketplace-sourced plugins/extensions — required alongside `--marketplace-api-key` whenever this project has one |
 | `--provisioners-config` | | YAML mapping plugin id → `{command, env, timeout}` for the `provision` action |
+| `--notifiers-config` | | YAML mapping event → `{command, env, timeout}` for the `notify` action |
 | `--plugin-secret-key` | `XCORE_PLUGIN_SECRET` | Host's own `plugins.secret_key` — signs `execution_mode: trusted` plugins so this host's strict_trusted check can load them |
 
 ## `deploy-marketplace`
@@ -178,11 +210,16 @@ xcore-agent watch --project-id <id> --xdevkey <key> --deployment-credential <cre
         [--interval 60] [--once] [--keep-snapshots 3]
         [--supervisor none|systemd|docker|kubernetes]
         [--systemd-user-scope] [--k8s-namespace <ns>] [--k8s-kubeconfig <path>] [--k8s-context <ctx>]
-        [--git-token HOST=TOKEN]... [--provisioners-config <path>]
+        [--git-token HOST=TOKEN]...
+        [--marketplace-url <url>] [--marketplace-api-key <key>] [--marketplace-signing-secret <secret>]
+        [--provisioners-config <path>] [--notifiers-config <path>]
 ```
 
-Options match `deploy` plus the loop controls from `watch-marketplace`
-(`--interval`, `--once`, `--keep-snapshots`, supervisor flags).
+Options match `deploy` (including `--marketplace-url`/`--marketplace-api-key`/
+`--marketplace-signing-secret`/`--notifiers-config`, but not
+`--plugin-secret-key`, which `watch` doesn't take) plus the loop controls
+from `watch-marketplace` (`--interval`, `--once`, `--keep-snapshots`,
+supervisor flags).
 
 ## `gc`
 
@@ -206,3 +243,72 @@ xcore-agent gc --project-root <path> [--cache-root <path>]
 | `--supervisor` | Which supervisor to use when `--force-restart` is set (default `systemd`) |
 | `--systemd-user-scope` | Use `systemctl --user` vs system-wide (default on) |
 | `--k8s-namespace` / `--k8s-kubeconfig` / `--k8s-context` | Kubernetes supervisor settings |
+
+## `resolve-sources`
+
+Resolve every `source:` declared in a project's own `install.yaml` directly
+onto its `plugins/`/`extensions/` directories, in place — **no `.xdeploy`
+artifact, no Hub, no Ed25519 signature involved at all**. Not affected by
+`deploy`/`watch`'s Hub-download caveat above: this never touches the Hub,
+only the marketplace's plain HMAC-signed ZIP endpoints (same ones
+`deploy-marketplace`/`xcli plugin install` use).
+
+For a project resolving its **own** sources against itself — typically a
+container image reconstructing its marketplace-sourced plugins at boot
+(`docker-entrypoint.sh`), before the app underneath ever loads them. See
+`agent.pipeline.DeploymentRunner._resolve_plugins` for the
+artifact-verifying equivalent used by `deploy`/`watch` instead.
+
+```
+xcore-agent resolve-sources <project-root> [--install-plan <path>]
+        [--marketplace-url <url>] [--marketplace-api-key <key>]
+        [--marketplace-signing-secret <secret>]
+        [--git-token HOST=TOKEN]... [--cache-root <path>]
+```
+
+| Option | Environment | Description |
+|---|---|---|
+| `project-root` | | Project root containing `deployment/install.yaml` and its `plugins/`/`extensions/` |
+| `--install-plan` | | Override path to `install.yaml` (default `<project-root>/deployment/install.yaml`) |
+| `--marketplace-url` | `XCORE_MARKETPLACE_URL` | Marketplace root, used for any step whose `source:` is a marketplace slug (default `https://marketplace.xcorehub.dev`) |
+| `--marketplace-api-key` | `XCORE_MARKETPLACE_API_KEY` | `xdevkeys` API key, required only if some step has a marketplace-slug `source:` |
+| `--marketplace-signing-secret` | `XCORE_MARKETPLACE_SIGNING_SECRET` | HMAC signing secret verifying marketplace-sourced steps — required alongside `--marketplace-api-key` whenever this project has one |
+| `--git-token` | | `HOST=TOKEN` for a private git host a source-based step may need (repeatable) — public repos and SSH URLs need none of this |
+| `--cache-root` | | Resolver cache directory (default `~/.cache/xcore-agent/resolve-sources`) |
+
+A step without a `source:` is assumed to already be present in the tree —
+nothing to resolve for it. Prints each resolved `(kind, id) -> target`.
+
+## `watch-sources`
+
+Poll the marketplace for every `source:` declared in a project's own
+`install.yaml` and re-resolve (in place) whichever ones have a newer
+published version — the multi-source counterpart to `watch-marketplace` for
+a project that **depends on** several independent marketplace plugins/
+extensions, rather than **being** one itself. `watch-marketplace` replays
+the *entire* `install.yaml` through a single fetched artifact, which breaks
+the moment more than one step declares its own `source:` — see
+`watch_sources.py`'s module docstring.
+
+Like `resolve-sources`, this never touches `install.yaml`'s own
+`start`/`healthcheck` steps and never restarts anything — see
+`--exit-on-update` below for the intended way to let a supervisor do that.
+
+```
+xcore-agent watch-sources <project-root>
+        --marketplace-api-key <key> --marketplace-signing-secret <secret>
+        [--marketplace-url <url>] [--install-plan <path>]
+        [--interval 300] [--once] [--exit-on-update] [--cache-root <path>]
+```
+
+| Option | Environment | Description |
+|---|---|---|
+| `project-root` | | Project root containing `deployment/install.yaml` and its `plugins/`/`extensions/` |
+| `--marketplace-api-key` | `XCORE_MARKETPLACE_API_KEY` | `xdevkeys` API key — required (unlike `resolve-sources`, where it's optional) |
+| `--marketplace-signing-secret` | `XCORE_MARKETPLACE_SIGNING_SECRET` | HMAC signing secret — required |
+| `--marketplace-url` | `XCORE_MARKETPLACE_URL` | Marketplace root (default `https://marketplace.xcorehub.dev`) |
+| `--install-plan` | | Override path to `install.yaml` (default `<project-root>/deployment/install.yaml`) |
+| `--interval` | | Seconds between marketplace checks (default 300) |
+| `--once` | | Check once and exit instead of looping forever |
+| `--exit-on-update` | | Exit (code 0) right after applying at least one update instead of continuing to poll — for a process supervisor that restarts the whole process to pick up the newly-written files (this command never restarts anything itself). Ignored with `--once`, which always exits after its single check |
+| `--cache-root` | | Resolver cache directory (default `~/.cache/xcore-agent/watch-sources`) |

@@ -5,6 +5,7 @@ what it received matches what was built, independently of the encryption layer.
 
 import re
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -39,22 +40,60 @@ class EnvironmentSpec(BaseModel):
 
 
 class PluginSource(BaseModel):
-    """Where to fetch a plugin's code from a git repository instead of (or
-    in addition to) what's embedded in the `.xdeploy` artifact — typically
-    handed out by a marketplace/registry as a resolvable link.
+    """Where to fetch a plugin's code from instead of (or in addition to)
+    what's embedded in the `.xdeploy` artifact — typically handed out by a
+    marketplace/registry as a resolvable link.
 
-    `ref` should be a commit SHA whenever integrity matters: it's the only
-    form that's content-addressed, so pinning to one lets `PluginRef.sha256`
-    (computed over the resolved tree) actually mean something. A branch or
-    tag is mutable — the code behind it can change without `sha256` in the
-    manifest ever being updated, silently defeating the tamper check.
+    Exactly one origin, not both:
+
+    - **Marketplace (preferred)** — `marketplace_slug` (+ optional
+      `marketplace_version`/`marketplace_kind`). Resolved at deploy time via
+      the real xcore-team/marketplace `GET /{slug}/install` endpoint
+      (`agent.marketplace_client.MarketplaceClient`), whose response is
+      HMAC-SHA256-signed — see `plugin_resolver.PluginResolver._resolve_
+      marketplace`. This is `xcli`'s default when it writes `.xcore-
+      registry.json` for a plugin installed *from* the marketplace (see
+      `xcli`'s `shared.record_install`): the marketplace is the
+      authoritative origin for anything published there, not an
+      alternative to git.
+    - **Git (fallback)** — `url` + `ref`, for a plugin never published to
+      the marketplace (an operator's own private fork, something still
+      under development). `ref` should be a commit SHA whenever integrity
+      matters: it's the only form that's content-addressed, so pinning to
+      one lets `PluginRef.sha256` (computed over the resolved tree) actually
+      mean something. A branch or tag is mutable — the code behind it can
+      change without `sha256` in the manifest ever being updated, silently
+      defeating the tamper check.
+
+    A marketplace-sourced plugin gets an equivalent integrity guarantee for
+    free from the HMAC signature itself (verified against the publisher's
+    `signing_secret` on every fetch), independently of whether `PluginRef.
+    sha256` is also pinned.
     """
 
     model_config = {"extra": "forbid"}
 
-    url: str
-    ref: str
+    marketplace_slug: str | None = None
+    marketplace_version: str = "latest"
+    marketplace_kind: Literal["plugin", "service"] = "plugin"
+
+    url: str | None = None
+    ref: str | None = None
     subdirectory: str | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_origin(self) -> "PluginSource":
+        has_marketplace = self.marketplace_slug is not None
+        has_git = self.url is not None
+        if has_marketplace == has_git:  # both set, or neither
+            raise ValueError(
+                "PluginSource needs exactly one origin: either 'marketplace_slug' "
+                "(preferred — resolved from the marketplace) or 'url' (+'ref', git "
+                "fallback for a plugin not published there), not both or neither"
+            )
+        if has_git and self.ref is None:
+            raise ValueError("git source ('url') requires 'ref'")
+        return self
 
 
 class PluginRef(BaseModel):

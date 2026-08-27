@@ -29,11 +29,15 @@ from pathlib import Path
 import yaml
 
 from .. import crypto
+from ..packer.builder import _read_plugins_dirname
+from ..plugin_resolver import PluginResolutionError, flatten_single_root, safe_extract_zip
 from ..schema.install import (
     ConfigurePluginStep,
     HealthcheckStep,
+    InstallExtensionStep,
     InstallPlan,
     InstallPluginStep,
+    NotifyStep,
     PrepareStep,
     ProvisionStep,
     RestartStep,
@@ -43,7 +47,7 @@ from ..schema.install import (
     WriteEnvStep,
 )
 from .errors import ArtifactError, DeploymentError
-from .install_driver import InstallDriver, Layout, Provisioner
+from .install_driver import InstallDriver, Layout, Notifier, Provisioner
 from .marketplace_client import FetchedArtifact, Kind, MarketplaceClient
 from .marketplace_state import (
     MARKETPLACE_TERMINAL_STATES,
@@ -80,6 +84,7 @@ class MarketplaceDeploymentRunner:
     host_id: str = "default"
     driver: InstallDriver | None = None
     provisioners: dict[str, Provisioner] | None = None
+    notifiers: dict[str, Notifier] | None = None
     # See pipeline.DeploymentRunner.plugin_secret_key — same mechanism, only
     # meaningful for kind="plugin" (a "service" install has no plugin.yaml/
     # execution_mode to sign; sign_installed_plugin no-ops on that).
@@ -97,8 +102,18 @@ class MarketplaceDeploymentRunner:
                 Layout(
                     project_root=self.project_root,
                     extracted_root=self.workdir / "extracted",
+                    # This flow never has a manifest.json (see _load_plan)
+                    # to read plugins_dirname back from, so — unlike
+                    # agent.pipeline.DeploymentRunner — it would otherwise
+                    # silently fall back to Layout's "plugins" default even
+                    # for a target project whose own integration.yaml
+                    # declares a different convention (e.g. "app/", see
+                    # xcore-team/marketplace), installing into a directory
+                    # the running app never reads from.
+                    plugins_dirname=_read_plugins_dirname(self.project_root),
                 ),
                 provisioners=self.provisioners,
+                notifiers=self.notifiers,
                 plugin_secret_key=self.plugin_secret_key,
             )
 
@@ -162,7 +177,19 @@ class MarketplaceDeploymentRunner:
     def _extract(self, artifact: FetchedArtifact) -> None:
         self._transition(MarketplaceDeploymentState.EXTRACTING)
         extracted_root = self.workdir / "extracted"
-        target = extracted_root / "plugins" / self.slug
+        assert self.driver is not None
+        # kind="service" extracts into extensions/<slug>, matching what
+        # InstallDriver.install_extension actually looks for — a
+        # kind=service deployment previously always extracted into
+        # plugins/<slug> regardless, which install_extension never reads
+        # from, silently installing nothing (see _dispatch's matching fix).
+        # kind="plugin" must match install_plugin's OWN lookup, which reads
+        # layout.plugins_dirname (now resolved from the target project's
+        # integration.yaml, see __post_init__) rather than a hardcoded
+        # "plugins" — staging anywhere else would leave install_plugin
+        # unable to find what was just extracted.
+        subdir = self.driver.layout.plugins_dirname if self.kind == "plugin" else "extensions"
+        target = extracted_root / subdir / self.slug
         if target.exists():
             shutil.rmtree(target)
         target.mkdir(parents=True, exist_ok=True)
@@ -171,10 +198,12 @@ class MarketplaceDeploymentRunner:
         zip_path.write_bytes(artifact.data)
         try:
             with zipfile.ZipFile(zip_path) as zf:
-                _safe_extract_zip(zf, target)
+                safe_extract_zip(zf, target)
         except zipfile.BadZipFile as exc:
             raise ArtifactError(f"fetched artifact is not a valid ZIP: {exc}") from exc
-        _flatten_single_root(target)
+        except PluginResolutionError as exc:
+            raise ArtifactError(str(exc)) from exc
+        flatten_single_root(target)
 
     def _load_plan(self, artifact: FetchedArtifact) -> None:
         self._transition(MarketplaceDeploymentState.LOADING_PLAN)
@@ -223,10 +252,14 @@ class MarketplaceDeploymentRunner:
             self.driver.provision(step)
         elif isinstance(step, InstallPluginStep):
             self.driver.install_plugin(step)
+        elif isinstance(step, InstallExtensionStep):
+            self.driver.install_extension(step)
         elif isinstance(step, ConfigurePluginStep):
             self.driver.configure_plugin(step)
         elif isinstance(step, WriteEnvStep):
             self.driver.write_env(step)
+        elif isinstance(step, NotifyStep):
+            self.driver.notify(step)
         elif isinstance(step, StartStep):
             self.driver.start(step)
         elif isinstance(step, StopStep):
@@ -283,29 +316,3 @@ class MarketplaceDeploymentRunner:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
-    """Extract a ZIP archive, rejecting any member that would escape `dest`
-    via `../` or an absolute path — same reasoning as pipeline.py's
-    `_safe_extract` for tar archives."""
-    dest_resolved = dest.resolve()
-    for name in zf.namelist():
-        member_path = (dest_resolved / name).resolve()
-        if not member_path.is_relative_to(dest_resolved):
-            raise ArtifactError(f"artifact contains an unsafe path: {name!r}")
-    zf.extractall(dest_resolved)  # noqa: S202 — membership already validated above
-
-
-def _flatten_single_root(target: Path) -> None:
-    """GitHub's zipball API wraps every archive in a single top-level
-    `owner-repo-<sha>/` directory. Strip it so `target` directly contains the
-    plugin's own files (plugin.yaml, src/, ...), matching the layout
-    `InstallDriver.install_plugin` expects."""
-    entries = list(target.iterdir())
-    if len(entries) != 1 or not entries[0].is_dir():
-        return
-    root = entries[0]
-    for child in root.iterdir():
-        shutil.move(str(child), str(target / child.name))
-    root.rmdir()

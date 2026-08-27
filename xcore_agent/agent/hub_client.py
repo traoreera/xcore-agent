@@ -243,10 +243,23 @@ def _raise_for_status(response: httpx.Response, error_cls: type[Exception], oper
         )
 
 
+_MOUNT = "/app/xdeploy"
+
+
 class HttpHubClient:
-    """HTTP implementation of `HubClient` against the proposed REST contract
-    documented in this module's docstring. Not yet validated against a real
-    XCore Hub — there isn't one to validate against.
+    """HTTP implementation of `HubClient` against the real xcore-team/xdeploy
+    plugin (`app/xdeploy`) — validated end to end against a live Hub
+    (build -> publish -> a real `POST /app/xdeploy/v1/projects/{id}/publish`
+    that stored the artifact).
+
+    `base_url` is the Hub's bare root (no `/app/...` segment — same
+    convention as `marketplace_client.MarketplaceClient`); every request
+    below prepends its own `/app/xdeploy` mount internally so callers never
+    need to know this backend's internal plugin layout. Every xcore plugin
+    (including this one) is mounted under `/app/<plugin-name>` by the xcore
+    router — the previous bare `/v1/...` paths here were a "proposed
+    contract" written before any real Hub existed to validate against, and
+    were 404ing against the real one.
 
     `transport` exists so tests can inject `httpx.MockTransport` instead of
     hitting the network; production callers leave it as `None`.
@@ -260,7 +273,24 @@ class HttpHubClient:
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._client = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"), timeout=timeout, transport=transport
+            base_url=base_url.rstrip("/"),
+            timeout=timeout,
+            transport=transport,
+            # `download_url` (from request_artifact) has come back as a bare
+            # `http://` URL in production while the Hub itself is HTTPS-only
+            # — the reverse proxy 301s to https://, and httpx does NOT
+            # follow redirects by default. Without this, `download()` was
+            # silently returning the redirect response's ~17-byte HTML body
+            # ("Moved Permanently") instead of the artifact, which then
+            # failed signature verification with no indication that the
+            # actual problem was a followed-nowhere redirect, not a bad
+            # signature. Real artifacts should never redirect again after
+            # this, but there is no security cost to allowing it either:
+            # every response we actually trust is authenticated by content
+            # (Ed25519 signature over the downloaded bytes, HMAC for the
+            # marketplace) rather than by transport, so a redirect changes
+            # where the bytes came from, never whether they're trusted.
+            follow_redirects=True,
         )
 
     async def __aenter__(self) -> "HttpHubClient":
@@ -279,7 +309,7 @@ class HttpHubClient:
 
     async def authenticate(self, *, xdevkey: str, project_id: str) -> Session:
         response = await self._client.post(
-            "/v1/auth", json={"xdevkey": xdevkey, "project_id": project_id}
+            f"{_MOUNT}/v1/auth", json={"xdevkey": xdevkey, "project_id": project_id}
         )
         if response.status_code in (401, 403):
             raise AuthenticationError(f"authentication failed: {_error_message(response)}")
@@ -288,14 +318,14 @@ class HttpHubClient:
 
     async def get_latest_version(self, session: Session, *, project_id: str) -> str:
         response = await self._client.get(
-            f"/v1/projects/{project_id}/versions/latest", headers=_auth_header(session)
+            f"{_MOUNT}/v1/projects/{project_id}/versions/latest", headers=_auth_header(session)
         )
         _raise_for_status(response, ArtifactError, "get_latest_version")
         return str(response.json()["version"])
 
     async def request_artifact(self, session: Session, *, version: str) -> ArtifactLocation:
         response = await self._client.get(
-            f"/v1/projects/{session.project_id}/artifacts/{version}",
+            f"{_MOUNT}/v1/projects/{session.project_id}/artifacts/{version}",
             headers=_auth_header(session),
         )
         _raise_for_status(response, ArtifactError, "request_artifact")
@@ -315,7 +345,7 @@ class HttpHubClient:
         self, session: Session, *, deployment_credential: str, artifact_signature: bytes
     ) -> bytes:
         response = await self._client.post(
-            "/v1/deployments/authorize",
+            f"{_MOUNT}/v1/deployments/authorize",
             headers=_auth_header(session),
             json={
                 "deployment_credential": deployment_credential,
@@ -331,7 +361,7 @@ class HttpHubClient:
 
     async def notify(self, session: Session, report: DeploymentReport) -> None:
         response = await self._client.post(
-            "/v1/deployments/report",
+            f"{_MOUNT}/v1/deployments/report",
             headers=_auth_header(session),
             json={
                 "project_id": report.project_id,
@@ -359,7 +389,7 @@ class HttpHubClient:
         signer_public_key: bytes,
     ) -> PublishResult:
         response = await self._client.post(
-            f"/v1/projects/{project_id}/publish",
+            f"{_MOUNT}/v1/projects/{project_id}/publish",
             headers={"X-API-Key": xdevkey},
             data={
                 "version": version,

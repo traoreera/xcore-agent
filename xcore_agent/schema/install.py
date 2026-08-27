@@ -12,6 +12,8 @@ from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .manifest import PluginSource
+
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _PLUGIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _DURATION_RE = re.compile(r"^(\d+)(s|m)$")
@@ -88,10 +90,46 @@ class ProvisionStep(_PluginStepBase):
 
 class InstallPluginStep(_PluginStepBase):
     action: Literal["install_plugin"] = "install_plugin"
+    # Where to fetch this plugin's code from — marketplace slug (preferred)
+    # or git (fallback), same `PluginSource` the packer would otherwise read
+    # off the plugin's own plugin.yaml (see packer.builder._read_plugin_
+    # source) or `.xcore-registry.json` (_read_registry_source). Declaring
+    # it here instead keeps plugin.yaml itself untouched — a project that
+    # wants its deployment-time origins centralized in one reviewable file
+    # (this one) rather than scattered across every plugin's own manifest.
+    # Checked first when the packer resolves a plugin's source at build
+    # time (see write_manifest); plugin.yaml's own `source:` and the
+    # registry are still consulted, in that order, if this step has none.
+    source: PluginSource | None = None
 
 
 class InstallExtensionStep(_ExtensionStepBase):
     action: Literal["install_extension"] = "install_extension"
+    # Mirrors InstallPluginStep.source, for extensions — see its docstring.
+    source: PluginSource | None = None
+
+
+class NotifyStep(_StepBase):
+    """Tells the agent's `notify()` a named event happened at this point in
+    the plan — never a URL/webhook/recipient itself (same reasoning as
+    `ProvisionStep.plugin`: the artifact only supplies an opaque label, the
+    real destination is host-side operator config, see `agent.notifiers`).
+    A missing or failing notifier never fails the deployment — notifying is
+    a side channel, not part of what makes an install succeed or fail."""
+
+    action: Literal["notify"] = "notify"
+    event: str
+    # Optional human-readable text for the notifier to use as-is, e.g.
+    # "auth deployed successfully" — not a template, no placeholder
+    # substitution happens on it.
+    message: str | None = None
+
+    @field_validator("event")
+    @classmethod
+    def _valid_event(cls, v: str) -> str:
+        if not _ID_RE.match(v):
+            raise ValueError(f"invalid notify event {v!r}: must match {_ID_RE.pattern}")
+        return v
 
 
 class ConfigurePluginStep(_PluginStepBase):
@@ -154,6 +192,7 @@ Step = Annotated[
         InstallExtensionStep,
         ConfigurePluginStep,
         WriteEnvStep,
+        NotifyStep,
         StartStep,
         StopStep,
         RestartStep,

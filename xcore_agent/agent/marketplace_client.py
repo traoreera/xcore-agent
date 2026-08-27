@@ -36,9 +36,10 @@ rather than a drop-in `HubClient` implementation:
     callers never need to know this backend's internal plugin layout.
 """
 
+import asyncio
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 
@@ -92,7 +93,18 @@ class MarketplaceClient:
     ) -> None:
         self._api_key = api_key
         self._client = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"), timeout=timeout, transport=transport
+            base_url=base_url.rstrip("/"),
+            timeout=timeout,
+            transport=transport,
+            # See HttpHubClient's identical setting for why — an unfollowed
+            # HTTP->HTTPS redirect silently truncates a response to its
+            # ~17-byte "Moved Permanently" body instead of raising, which
+            # then fails signature verification with no hint that a
+            # redirect (not a bad signature) was the real cause. No
+            # security cost here either: every response this client trusts
+            # is authenticated by content (HMAC-SHA256 over the fetched
+            # bytes), not by transport.
+            follow_redirects=True,
         )
 
     async def __aenter__(self) -> "MarketplaceClient":
@@ -110,10 +122,22 @@ class MarketplaceClient:
         await self._client.aclose()
 
     async def get_latest_version(self, *, slug: str, kind: Kind = "plugin") -> str:
-        """Poll target for `agent.watcher.Watcher` — reads the public
-        `GET /{kind}/{slug}` detail route, which reports `latest_version`."""
+        """Poll target for `agent.watcher.Watcher`/`watch_sources` — reads
+        the `GET /{kind}/{slug}` detail route, which reports
+        `latest_version`. Public for a `visibility="public"` target, but
+        sends X-API-Key anyway (real prod bug found running watch-sources
+        against a project with several private sources: this route only
+        recognized a JWT session, never an xdevkey, so a private plugin
+        404'd for every xcore-agent caller regardless of whether its key
+        actually had access — see xcore-team/marketplace's `_api_key_
+        viewer_id`/xcore-team/xservices's route fix for the server side of
+        this same commit)."""
         mount = _mount(_KIND_HUB_PLUGIN[kind])
-        response = await self._client.get(f"{mount}/{_kind_path(kind)}/{slug}")
+        response = await _get_with_retry(
+            self._client,
+            f"{mount}/{_kind_path(kind)}/{slug}",
+            headers={"X-API-Key": self._api_key},
+        )
         _raise_for_status(response, "get_latest_version")
         latest = response.json().get("latest_version")
         if not latest:
@@ -124,7 +148,8 @@ class MarketplaceClient:
         self, *, slug: str, version: str = "latest", kind: Kind = "plugin"
     ) -> FetchedArtifact:
         mount = _mount(_KIND_HUB_PLUGIN[kind])
-        response = await self._client.get(
+        response = await _get_with_retry(
+            self._client,
             f"{mount}/{_kind_path(kind)}/{slug}/install",
             params={"version": version},
             headers={"X-API-Key": self._api_key},
@@ -194,6 +219,37 @@ def _error_message(response: httpx.Response) -> str:
         return str(body)
     except ValueError:
         return response.text[:200]
+
+
+# Status codes worth retrying — transient infrastructure noise (a rolling
+# deploy briefly routing to a stale/not-yet-ready replica), not a real
+# "this doesn't exist" or "you're not allowed" answer. Verified against
+# the real Hub: the exact same request for a plugin confirmed to exist
+# alternated between 200 and 404 across consecutive calls seconds apart —
+# a 404 here is not reliably final the way it would be for a REST
+# resource that's actually, permanently absent, so it's included alongside
+# the more obviously-transient 5xx codes.
+_RETRYABLE_STATUS = frozenset({404, 500, 502, 503, 504})
+_RETRY_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = (1.0, 2.0)  # between attempts 1->2 and 2->3
+
+
+async def _get_with_retry(client: httpx.AsyncClient, url: str, **kwargs: Any) -> httpx.Response:
+    """GET with a short retry-with-backoff for `_RETRYABLE_STATUS` — see
+    its docstring for why. Only used for read-only GETs (`get_latest_
+    version`, `fetch_artifact`); never for the mutating `report_
+    deployment`, which is already best-effort at the caller level (see its
+    own docstring) — retrying there would risk duplicate side effects for
+    no benefit a client-side caller doesn't already tolerate."""
+    response: httpx.Response | None = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        response = await client.get(url, **kwargs)
+        if response.status_code not in _RETRYABLE_STATUS:
+            return response
+        if attempt < _RETRY_ATTEMPTS - 1:
+            await asyncio.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+    assert response is not None
+    return response
 
 
 def _raise_for_status(response: httpx.Response, operation: str) -> None:

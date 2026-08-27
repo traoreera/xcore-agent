@@ -19,10 +19,21 @@ class InstalledState:
 
 
 class StateStore:
-    """Persists install state as `<project_root>/.xcore/state.json`."""
+    """Persists install state as `<project_root>/.xcore/state.json` — or,
+    with `namespace` set, `<project_root>/.xcore/state-<namespace>.json`.
 
-    def __init__(self, project_root: Path) -> None:
-        self._path = project_root / ".xcore" / "state.json"
+    `namespace` matters as soon as more than one deployment shares a
+    `project_root` (e.g. `MarketplaceWatcher` polling several independent
+    slugs against the same host): without it, every watcher reads/writes
+    the SAME file, so each poll clobbers the others' recorded version and
+    every watcher but the last-written-one redeploys on every single check,
+    mistaking a sibling's state for its own. Omit it (the default) for the
+    single-project-per-root case (`agent.watcher.Watcher`), which never had
+    this problem and keeps its existing `state.json` path unchanged."""
+
+    def __init__(self, project_root: Path, *, namespace: str | None = None) -> None:
+        filename = f"state-{namespace}.json" if namespace else "state.json"
+        self._path = project_root / ".xcore" / filename
 
     def read(self) -> InstalledState | None:
         if not self._path.is_file():

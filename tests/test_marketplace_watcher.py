@@ -115,7 +115,7 @@ def _make_watcher(tmp_path: Path, client) -> MarketplaceWatcher:
 async def test_check_once_skips_when_version_unchanged(tmp_path):
     client = _make_client(tmp_path, version="1.0.0")
     project_root = tmp_path / "deployed"
-    StateStore(project_root).write(project_id=SLUG, version="1.0.0")
+    StateStore(project_root, namespace=SLUG).write(project_id=SLUG, version="1.0.0")
 
     watcher = _make_watcher(tmp_path, client)
     result = await watcher.check_once()
@@ -135,7 +135,7 @@ async def test_check_once_deploys_new_version_and_persists_state(tmp_path):
     assert result.report.status == "success"
     assert (tmp_path / "deployed" / "plugins" / SLUG / "plugin.yaml").is_file()
 
-    state = StateStore(tmp_path / "deployed").read()
+    state = StateStore(tmp_path / "deployed", namespace=SLUG).read()
     assert state.version == "1.0.0"
     assert state.project_id == SLUG
 

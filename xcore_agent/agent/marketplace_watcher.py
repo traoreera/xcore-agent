@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .gc import GarbageCollector
-from .install_driver import Layout, Provisioner, Supervisor
+from .install_driver import Layout, Notifier, Provisioner, Supervisor
 from .marketplace_client import Kind, MarketplaceClient
 from .marketplace_pipeline import MarketplaceDeploymentReport, MarketplaceDeploymentRunner
 from .state_store import StateStore
@@ -45,6 +45,7 @@ class MarketplaceWatcher:
         keep_snapshots: int = 3,
         supervisor: Supervisor | None = None,
         provisioners: dict[str, Provisioner] | None = None,
+        notifiers: dict[str, Notifier] | None = None,
     ) -> None:
         self._client = client
         self._slug = slug
@@ -57,7 +58,11 @@ class MarketplaceWatcher:
         self._keep_snapshots = keep_snapshots
         self._supervisor = supervisor
         self._provisioners = provisioners
-        self._state = StateStore(project_root)
+        self._notifiers = notifiers
+        # namespace=slug: see StateStore's own docstring — several
+        # MarketplaceWatchers (one per slug) can share a project_root
+        # without clobbering each other's recorded version.
+        self._state = StateStore(project_root, namespace=slug)
 
     async def check_once(self) -> MarketplaceWatchResult:
         latest = await self._client.get_latest_version(slug=self._slug, kind=self._kind)
@@ -77,6 +82,7 @@ class MarketplaceWatcher:
             kind=self._kind,
             host_id=self._host_id,
             provisioners=self._provisioners,
+            notifiers=self._notifiers,
         )
         report = await runner.run()
         self._state.write(project_id=self._slug, version=latest)

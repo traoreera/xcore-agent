@@ -17,6 +17,91 @@ def _json_response(status_code: int, payload: dict) -> httpx.Response:
     return httpx.Response(status_code, json=payload)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_sleep(monkeypatch):
+    """Every retry test below exercises the real backoff loop — patch
+    asyncio.sleep to a no-op so they run instantly instead of taking
+    seconds, without touching the retry logic itself."""
+
+    async def _instant_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("xcore_agent.agent.marketplace_client.asyncio.sleep", _instant_sleep)
+
+
+# ── Retry-with-backoff on transient status codes (404/5xx) — see the real- ──
+# ── prod flakiness this guards against in _get_with_retry's docstring.    ──
+
+
+async def test_fetch_artifact_retries_on_404_then_succeeds():
+    zip_bytes = b"PK\x03\x04fake-zip-bytes"
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            return httpx.Response(404, json={"detail": "Not Found"})
+        return httpx.Response(
+            200, content=zip_bytes, headers={"X-Signature": "hmac_sha256:deadbeef"}
+        )
+
+    async with MarketplaceClient(
+        "https://hub.example", api_key="xdk_test", transport=httpx.MockTransport(handler)
+    ) as client:
+        artifact = await client.fetch_artifact(slug="my-plugin", version="1.2.3")
+
+    assert artifact.data == zip_bytes
+    assert calls == 3
+
+
+async def test_fetch_artifact_gives_up_after_exhausting_retries():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    async with MarketplaceClient(
+        "https://hub.example", api_key="xdk_test", transport=httpx.MockTransport(handler)
+    ) as client:
+        with pytest.raises(ArtifactError, match="fetch_artifact failed"):
+            await client.fetch_artifact(slug="my-plugin", version="1.2.3")
+
+
+async def test_fetch_artifact_does_not_retry_on_401():
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(401, json={"detail": "invalid key"})
+
+    async with MarketplaceClient(
+        "https://hub.example", api_key="xdk_test", transport=httpx.MockTransport(handler)
+    ) as client:
+        with pytest.raises(ArtifactError, match="API key rejected"):
+            await client.fetch_artifact(slug="my-plugin", version="1.2.3")
+
+    assert calls == 1  # not a retryable status — fails on the first try
+
+
+async def test_get_latest_version_retries_on_503_then_succeeds():
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls < 2:
+            return httpx.Response(503, text="service unavailable")
+        return _json_response(200, {"slug": "my-plugin", "latest_version": "2.0.0"})
+
+    async with MarketplaceClient(
+        "https://hub.example", api_key="xdk_test", transport=httpx.MockTransport(handler)
+    ) as client:
+        version = await client.get_latest_version(slug="my-plugin")
+
+    assert version == "2.0.0"
+    assert calls == 2
+
+
 async def test_get_latest_version_reads_plugin_detail():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/app/marketplace/plugins/my-plugin"
@@ -28,6 +113,23 @@ async def test_get_latest_version_reads_plugin_detail():
         version = await client.get_latest_version(slug="my-plugin")
 
     assert version == "1.2.3"
+
+
+async def test_get_latest_version_sends_api_key():
+    # Real bug: this route only recognized a JWT session server-side, never
+    # an xdevkey — sending no auth here meant a visibility="private" target
+    # 404'd for every xcore-agent caller regardless of whether its key
+    # actually had access. Fixed server-side (xcore-team/marketplace,
+    # xcore-team/xservices) AND here — both halves needed for a private
+    # source to actually work with watch-sources.
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["x-api-key"] == "xdk_test"
+        return _json_response(200, {"slug": "my-plugin", "latest_version": "1.2.3"})
+
+    async with MarketplaceClient(
+        "https://hub.example", api_key="xdk_test", transport=httpx.MockTransport(handler)
+    ) as client:
+        await client.get_latest_version(slug="my-plugin")
 
 
 async def test_get_latest_version_uses_services_path_for_service_kind():
@@ -80,6 +182,34 @@ async def test_fetch_artifact_sends_api_key_and_parses_headers():
     assert artifact.signature_header == "hmac_sha256:deadbeef"
     assert artifact.plugin_header == "my-plugin@1.2.3"
     assert artifact.repo_header == "acme/my-plugin@1.2.3"
+
+
+async def test_fetch_artifact_follows_redirect_instead_of_returning_its_body():
+    # Same real-prod failure mode as HttpHubClient.download: an unfollowed
+    # 301 (e.g. a reverse proxy enforcing HTTPS) would silently return its
+    # ~17-byte "Moved Permanently" body as if it were the plugin's ZIP,
+    # which then fails HMAC verification with no hint a redirect happened.
+    zip_bytes = b"PK\x03\x04fake-zip-bytes"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/app/marketplace/plugins/my-plugin/install":
+            return httpx.Response(
+                301,
+                headers={
+                    "Location": "https://hub.example/app/marketplace/plugins/my-plugin/install/"
+                },
+            )
+        assert request.url.path == "/app/marketplace/plugins/my-plugin/install/"
+        return httpx.Response(
+            200, content=zip_bytes, headers={"X-Signature": "hmac_sha256:deadbeef"}
+        )
+
+    async with MarketplaceClient(
+        "https://hub.example", api_key="xdk_test", transport=httpx.MockTransport(handler)
+    ) as client:
+        artifact = await client.fetch_artifact(slug="my-plugin", version="1.2.3")
+
+    assert artifact.data == zip_bytes
 
 
 async def test_fetch_artifact_uses_x_service_header_for_service_kind():
