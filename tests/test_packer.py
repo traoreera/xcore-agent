@@ -640,6 +640,104 @@ def test_source_based_extension_is_pruned_to_manifest_only(tmp_path):
     assert (src / "extensions" / "mail" / "client.py").is_file()  # source_root untouched
 
 
+def test_service_yaml_extension_source_is_pruned_to_manifest_only(tmp_path):
+    # Every real extension in this ecosystem (xmailler, xwebsocket,
+    # extpubsub, ...) uses service.yaml as its manifest, never
+    # extension.yaml — this is the file _find_extension_manifest/
+    # _read_extension_source must actually find a `source:` block in,
+    # not just the generic "extension.yaml" name this packer originally
+    # only supported.
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "extensions" / "mail").mkdir(parents=True)
+    (src / "extensions" / "mail" / "service.yaml").write_text(
+        "source:\n  url: https://github.com/acme/mail-ext.git\n  ref: " + "b" * 40 + "\n"
+    )
+    (src / "extensions" / "mail" / "client.py").write_text("# should NOT end up in the artifact\n")
+    (src / "deployment" / "install.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "format_version": "1",
+                "project_id": PROJECT_ID,
+                "version": "1.0.0",
+                "steps": [
+                    {"id": "prepare", "action": "prepare"},
+                    {"id": "install_demo", "action": "install_plugin", "plugin": "demo"},
+                    {"id": "install_mail", "action": "install_extension", "extension": "mail"},
+                ],
+            }
+        )
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    assert result.manifest.extensions[0].sha256 is None
+    assert result.manifest.extensions[0].source.ref == "b" * 40
+
+    members = _extracted_member_names(result)
+    assert "./extensions/mail/service.yaml" in members
+    assert "./extensions/mail/client.py" not in members
+    assert (src / "extensions" / "mail" / "client.py").is_file()  # source_root untouched
+
+
+def test_registry_source_resolves_extension_kind_to_service(tmp_path):
+    # xcli's own registry vocabulary calls this an "extension" (matching
+    # its plugin/extension split) but PluginSource.marketplace_kind only
+    # accepts "plugin"/"service" — without translating "extension" ->
+    # "service", constructing PluginSource raised inside a bare except and
+    # silently fell back to "embed the actual files", exactly the bug an
+    # xmailler/xwebsocket/extpubsub install from the real marketplace hit.
+    src = tmp_path / "src"
+    src.mkdir()
+    _minimal_source_tree(src)
+    (src / "extensions" / "mail").mkdir(parents=True)
+    (src / "extensions" / "mail" / "client.py").write_text("# should NOT end up in the artifact\n")
+    # No source: in mail's own manifest — must fall back to the registry.
+    (src / "plugins" / ".xcore-registry.json").write_text(
+        '{"mail": {"source": "marketplace", "slug": "mail", "version": "2.0.0", '
+        '"kind": "extension", "repository": "https://github.com/acme/mail-ext"}}'
+    )
+    (src / "deployment" / "install.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "format_version": "1",
+                "project_id": PROJECT_ID,
+                "version": "1.0.0",
+                "steps": [
+                    {"id": "prepare", "action": "prepare"},
+                    {"id": "install_demo", "action": "install_plugin", "plugin": "demo"},
+                    {"id": "install_mail", "action": "install_extension", "extension": "mail"},
+                ],
+            }
+        )
+    )
+
+    result = build_artifact(
+        src,
+        project_id=PROJECT_ID,
+        project_name="demo-project",
+        version="1.0.0",
+        output_path=tmp_path / "out.xdeploy.enc",
+    )
+
+    ext = result.manifest.extensions[0]
+    assert ext.sha256 is None
+    assert ext.source.marketplace_slug == "mail"
+    assert ext.source.marketplace_version == "2.0.0"
+    assert ext.source.marketplace_kind == "service"  # not "extension"
+
+    members = _extracted_member_names(result)
+    assert "./extensions/mail/client.py" not in members
+    assert (src / "extensions" / "mail" / "client.py").is_file()  # source_root untouched
+
+
 def test_install_extension_step_referencing_missing_extension_dir_is_rejected(tmp_path):
     src = tmp_path / "src"
     src.mkdir()

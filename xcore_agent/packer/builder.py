@@ -35,7 +35,12 @@ from ..schema.manifest import (
 
 MANIFEST_FILENAME = "manifest.json"
 INSTALL_PLAN_PATH = "deployment/install.yaml"
-EXTENSION_MANIFEST_FILENAME = "extension.yaml"
+# "extension.yaml" was this packer's original, generic name for an
+# extension's own manifest — nothing in this ecosystem ever actually
+# writes a file by that name; every real extension (xmailler, xwebsocket,
+# extpubsub, ...) uses "service.yaml". Checked in this order (service.yaml
+# first) so a project's real manifest always wins.
+EXTENSION_MANIFEST_FILENAMES = ("service.yaml", "extension.yaml")
 
 # Never copied into the packaging view, regardless of what a project's
 # .dockerignore/.gitignore does or doesn't say — matched by basename
@@ -263,18 +268,27 @@ def write_manifest(
     extensions_dir = source_root / "extensions"
     if extensions_dir.is_dir():
         for extension_dir in sorted(p for p in extensions_dir.iterdir() if p.is_dir()):
-            # extension.yaml is optional — absent means "embedded, hash the
-            # whole directory" (the original, still-default behavior);
-            # a source resolved (install.yaml, extension.yaml's own
-            # `source:`, or the registry — same priority as plugins above)
-            # means "resolved at deploy time, nothing to hash here".
-            ext_source = extension_sources.get(extension_dir.name) or _read_extension_source(
-                extension_dir / EXTENSION_MANIFEST_FILENAME
+            # A manifest file is optional — absent means "embedded, hash
+            # the whole directory" (the original, still-default behavior);
+            # a source resolved (install.yaml, the manifest's own
+            # `source:`, or the registry — same priority and same shared
+            # .xcore-registry.json as plugins above, see _read_registry_
+            # source's docstring for why registry_dir=plugins_dir is
+            # required here) means "resolved at deploy time, nothing to
+            # hash here".
+            ext_manifest_path = _find_extension_manifest(extension_dir)
+            ext_source = (
+                extension_sources.get(extension_dir.name)
+                or (_read_extension_source(ext_manifest_path) if ext_manifest_path else None)
+                or _read_registry_source(extension_dir, registry_dir=plugins_dir)
+            )
+            manifest_filename = (
+                ext_manifest_path.name if ext_manifest_path else EXTENSION_MANIFEST_FILENAMES[0]
             )
             if ext_source is not None:
                 pruned_relpaths.update(
                     _non_manifest_relpaths(
-                        extension_dir, EXTENSION_MANIFEST_FILENAME, source_root=source_root
+                        extension_dir, manifest_filename, source_root=source_root
                     )
                 )
             extension_refs.append(
@@ -475,35 +489,41 @@ def _read_plugin_source(plugin_yaml: Path) -> PluginSource | None:
         raise BuildError(f"{plugin_yaml} has an invalid 'source' block: {exc}") from exc
 
 
-def _read_registry_source(plugin_dir: Path) -> PluginSource | None:
-    """Fallback for a plugin with no explicit `source:` in its own
-    plugin.yaml: check `.xcore-registry.json`, a sibling of every plugin
-    directory (`plugins_dir / ".xcore-registry.json"`) written by `xcli
-    plugin install --source marketplace|git` — see xcoreCli's
-    install_commands.py. Lets a plugin installed that way get resolved
-    from its real origin at deploy time automatically, without an operator
-    hand-writing `source:` into plugin.yaml (what this whole mechanism used
-    to require — see the xauth/xmailler/etc. plugin.yaml edits that
-    motivated this).
+def _read_registry_source(item_dir: Path, *, registry_dir: Path | None = None) -> PluginSource | None:
+    """Fallback for a plugin/extension with no explicit `source:` in its own
+    manifest: check `.xcore-registry.json`, written by `xcli plugin install
+    --source marketplace|git` (and the equivalent `xcli service install`)
+    — see xcoreCli's install_commands.py. Lets something installed that
+    way get resolved from its real origin at deploy time automatically,
+    without an operator hand-writing `source:` into its manifest (what this
+    whole mechanism used to require — see the xauth/xmailler/etc. manifest
+    edits that motivated this).
+
+    `registry_dir` defaults to `item_dir.parent` — correct for a plugin,
+    since the registry sits next to the plugins directory. An extension
+    must pass `registry_dir=plugins_dir` explicitly: xcli's own
+    `registry_path()` always writes ONE shared `.xcore-registry.json` next
+    to the PLUGINS directory, regardless of whether the entry describes a
+    plugin or an extension — `extension_dir.parent` (`extensions/`) would
+    look in the wrong place and silently find nothing.
 
     Marketplace-primary, git-fallback — same rule as `PluginSource` itself:
     a 'marketplace' entry resolves via `slug`/`kind`/`version` (the
     marketplace stays the authoritative origin even though the registry
     also records the `X-Repo` GitHub coordinates as a courtesy), a 'git'
     entry resolves via `repository`/`ref` because that IS its only origin
-    (a plugin never installed from the marketplace, i.e. `xcli plugin
-    install --source git`). Anything else (a local zip install, a
-    partial/failed registry write, an entry missing what its own source
-    kind requires) falls through to the safe default: embed the plugin's
-    actual files instead of guessing at a source."""
-    registry_path = plugin_dir.parent / ".xcore-registry.json"
+    (never installed from the marketplace, i.e. `--source git`). Anything
+    else (a local zip install, a partial/failed registry write, an entry
+    missing what its own source kind requires) falls through to the safe
+    default: embed the actual files instead of guessing at a source."""
+    registry_path = (registry_dir or item_dir.parent) / ".xcore-registry.json"
     if not registry_path.is_file():
         return None
     try:
         registry = json.loads(registry_path.read_text())
     except (OSError, ValueError):
         return None
-    entry = registry.get(plugin_dir.name)
+    entry = registry.get(item_dir.name)
     if not isinstance(entry, dict):
         return None
 
@@ -511,11 +531,23 @@ def _read_registry_source(plugin_dir: Path) -> PluginSource | None:
         slug = entry.get("slug")
         if not slug:
             return None
+        # xcli's registry vocabulary isn't the same as PluginSource's:
+        # `xcli service install` records "kind": "extension" (matching its
+        # own `plugin`/`extension` split), but PluginSource.marketplace_kind
+        # is Literal["plugin", "service"] — "extension" isn't a valid value
+        # there. Without this translation, every marketplace-sourced
+        # extension's PluginSource(...) construction below raised (caught
+        # by the blanket except, so silently) and fell through to "embed
+        # the actual files", exactly the bug this whole fallback exists to
+        # avoid.
+        kind = entry.get("kind") or "plugin"
+        if kind == "extension":
+            kind = "service"
         try:
             return PluginSource(
                 marketplace_slug=slug,
                 marketplace_version=entry.get("version") or "latest",
-                marketplace_kind=entry.get("kind") or "plugin",
+                marketplace_kind=kind,
             )
         except Exception:
             return None
@@ -532,10 +564,25 @@ def _read_registry_source(plugin_dir: Path) -> PluginSource | None:
     return None
 
 
+def _find_extension_manifest(extension_dir: Path) -> Path | None:
+    """Locate an extension's own manifest file, trying each name in
+    EXTENSION_MANIFEST_FILENAMES in order (service.yaml first — the only
+    one anything in this ecosystem actually writes). None means "embedded,
+    no manifest at all", same as a missing extension.yaml used to mean
+    before service.yaml support existed."""
+    for name in EXTENSION_MANIFEST_FILENAMES:
+        candidate = extension_dir / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def _read_extension_source(extension_yaml: Path) -> PluginSource | None:
-    """Same as `_read_plugin_source`, but `extension.yaml` itself is
-    optional (an embedded extension needs no manifest file at all — unlike
-    a plugin, which always needs plugin.yaml for version/execution_mode/...)."""
+    """Same as `_read_plugin_source`, but the manifest itself is optional
+    (an embedded extension needs no manifest file at all — unlike a
+    plugin, which always needs plugin.yaml for version/execution_mode/...).
+    Caller resolves which manifest filename to look at via
+    _find_extension_manifest; this just reads whatever path it's given."""
     if not extension_yaml.is_file():
         return None
     data = yaml.safe_load(extension_yaml.read_text()) or {}
@@ -567,8 +614,16 @@ def _prepare_packaging_view(
 
     for extension in manifest.extensions:
         if extension.source is not None:
+            ext_dir = packaging_root / "extensions" / extension.id
+            # Re-detect which manifest filename this extension actually
+            # uses (service.yaml in practice) — packaging_root is a fresh,
+            # unpruned copy of source_root at this point, so the file is
+            # still there to find. Pruning to the WRONG hardcoded name
+            # would delete the real manifest and keep nothing.
+            ext_manifest_path = _find_extension_manifest(ext_dir)
             _prune_to_manifest_only(
-                packaging_root / "extensions" / extension.id, EXTENSION_MANIFEST_FILENAME
+                ext_dir,
+                ext_manifest_path.name if ext_manifest_path else EXTENSION_MANIFEST_FILENAMES[0],
             )
 
 
